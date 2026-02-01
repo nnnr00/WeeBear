@@ -12,6 +12,7 @@ const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 
 // ==================================================================
 // ⚠️⚠️⚠️ 请在此处填入你的图片 File ID ⚠️⚠️⚠️
+// (部署后通过 /admin -> File ID 工具获取)
 // ==================================================================
 
 const PAYMENT_QR_FILE_ID = ""; 
@@ -94,7 +95,8 @@ function createPaginationKeyboard(currentPage, totalCount, prefix) {
 
 // --- 核心逻辑封装 ---
 
-// 统一的兑换处理函数 (支持链接直达和按钮点击)
+// 统一的兑换处理函数
+// isFromLink: 如果是真的，发完货后自动跳转到 /dh
 async function tryRedeemProduct(ctx, productId, isFromLink = false) {
   const userData = await getOrInitUser(ctx);
   
@@ -126,7 +128,8 @@ async function tryRedeemProduct(ctx, productId, isFromLink = false) {
   // 3. 扣除次数并发送
   await incrementUserCount(ctx.from.id);
   
-  await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: \`${product.content}\`\n\n(点击内容可复制)`, { parse_mode: "Markdown" });
+  // 【修改点】：去掉了内容周围的 ` ` 反引号，取消了点击复制样式，只保留加粗
+  await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: **${product.content}**`, { parse_mode: "Markdown" });
   
   if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: "兑换成功！" });
@@ -134,9 +137,8 @@ async function tryRedeemProduct(ctx, productId, isFromLink = false) {
       await showRedeemPage(ctx, 1); 
   } else {
       // 如果是从链接 (get_123) 进来的，发完货后，自动跳转到 /dh 列表
-      if (isFromLink) {
-          await showRedeemPage(ctx, 1);
-      }
+      // 不管 isFromLink 是啥，只要是兑换成功都展示列表比较友好
+      await showRedeemPage(ctx, 1);
   }
 }
 
@@ -221,11 +223,11 @@ async function showVipPage(ctx) {
 
 // --- 路由与命令处理 ---
 
-// 1. /start 命令
+// 1. /start 命令 (支持 vip, hy, dh, get_123)
 bot.command("start", async (ctx) => {
     const payload = ctx.match; 
 
-    if (payload === "vip") {
+    if (payload === "vip" || payload === "hy") {
         await showVipPage(ctx);
     } 
     else if (payload === "dh") {
@@ -234,7 +236,7 @@ bot.command("start", async (ctx) => {
     else if (payload && payload.startsWith("get_")) {
         const productId = payload.replace("get_", ""); 
         if (/^\d+$/.test(productId)) {
-            // 参数 true 表示这是从链接进来的，发货后要跳到 /dh
+            // 参数 true 表示这是从链接进来的
             await tryRedeemProduct(ctx, productId, true);
         } else {
             await ctx.reply("⚠️ 无效的商品链接");
@@ -244,6 +246,17 @@ bot.command("start", async (ctx) => {
     else {
         await showStartPage(ctx);
     }
+});
+
+// 【新增】/cz 重置管理员状态
+bot.command("cz", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    // 重置当前管理员的：次数、VIP状态、错误尝试、锁定时间
+    await pool.query(
+        "UPDATE users SET daily_count = 0, is_vip = FALSE, payment_attempts = 0, payment_lockout_until = NULL WHERE telegram_id = $1",
+        [ADMIN_ID]
+    );
+    await ctx.reply("✅ **测试模式：重置成功**\n\n您现在是：普通用户\n今日次数：0/3\n无锁定状态", { parse_mode: "Markdown" });
 });
 
 // 2. VIP 按钮回调
@@ -363,7 +376,7 @@ async function showRedeemPage(ctx, page) {
 bot.command("dh", (ctx) => showRedeemPage(ctx, 1));
 bot.callbackQuery(/dh_page_(\d+)/, (ctx) => showRedeemPage(ctx, parseInt(ctx.match[1])));
 
-// 兑换回调 (按钮点击，不是链接进来的)
+// 兑换回调
 bot.callbackQuery(/try_redeem_(\d+)/, async (ctx) => {
   const productId = ctx.match[1];
   await tryRedeemProduct(ctx, productId, false);
@@ -387,7 +400,7 @@ bot.command("admin", (ctx) => {
 function showAdminPanel(ctx) {
   const keyboard = new InlineKeyboard()
     .text("📂 File ID 工具", "admin_fileid").row()
-    .text("🛍️ 商品管理 (/a)", "sj_page_1"); // 菜单文字已更新
+    .text("🛍️ 商品管理 (/a)", "sj_page_1");
   const text = "🔧 **后台管理面板**\n━━━━━━━━━━━━━━\n输入 /c 可随时取消并返回。";
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
@@ -412,7 +425,7 @@ bot.callbackQuery("fid_get", async (ctx) => {
   ctx.editMessageText("📸 请发送一张图片...", { reply_markup: keyboard });
 });
 
-// 7. /a 商品管理 (原 /sj)
+// 7. /a 商品管理
 async function showSjPage(ctx, page) {
   const offset = (page - 1) * 10;
   const countRes = await pool.query("SELECT COUNT(*) FROM products");
@@ -421,12 +434,13 @@ async function showSjPage(ctx, page) {
   const keyboard = new InlineKeyboard();
   keyboard.text("➕ 上架新商品", "sj_add_new").row();
   itemsRes.rows.forEach(item => {
+    // 按钮上显示ID，方便复制
     keyboard.text(`❌ [${item.id}] ${item.name}`, `sj_del_ask_${item.id}`).row();
   });
   const navRow = createPaginationKeyboard(page, totalCount, "sj");
   keyboard.row(...navRow);
   keyboard.row().text("🔙 返回后台", "back_to_admin");
-  const text = `🛍️ **商品管理** (第 ${page} 页)\n商品名前的数字是ID，用于推广链接。`;
+  const text = `🛍️ **商品管理** (第 ${page} 页)\n商品名前的数字是ID，用于推广链接 (get_ID)。`;
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
         ctx.deleteMessage().catch(()=>{});
@@ -507,15 +521,20 @@ bot.on("message", async (ctx) => {
 
   // 2. 管理员状态
   if (userId === ADMIN_ID && userState.state !== "idle") {
+    
+    // 【修改点】修复死机问题：回复ID时不使用 Markdown 格式，防止符号报错；并立即 return
     if (userState.state === "awaiting_photo") {
       if (ctx.message.photo) {
         const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-        await ctx.reply(`🆔 **File ID**:\n\`${fileId}\`\n\n(请根据用途，将此ID填入代码顶部的 PAYMENT_QR_FILE_ID 或 ORDER_EXAMPLE_FILE_ID 变量中)`, { parse_mode: "MarkdownV2" });
+        // 使用普通文本回复 ID，避免 Markdown 错误
+        await ctx.reply(`File ID (请复制): \n${fileId}`);
+        // 立即清空状态
         await clearState(userId);
+        await ctx.reply("✅ ID 获取成功，状态已重置。");
       } else {
-        ctx.reply("⚠️ 请发送图片，或输入 /c 取消。");
+        await ctx.reply("⚠️ 请发送图片，或输入 /c 取消。");
       }
-      return;
+      return; // 阻断后续逻辑
     } 
     else if (userState.state === "awaiting_name") {
         await setState(userId, "awaiting_content", text);
@@ -528,7 +547,7 @@ bot.on("message", async (ctx) => {
         await ctx.reply(`🎉 **上架成功！**`, { parse_mode: "Markdown" });
         await clearState(userId);
         // 上架成功 -> 自动跳转回 /a
-        showSjPage(ctx, 1);
+        await showSjPage(ctx, 1);
         return;
     }
   }
