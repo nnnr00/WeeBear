@@ -1,4 +1,3 @@
-// api/index.js
 const { Bot, webhookCallback, InlineKeyboard } = require("grammy");
 const { Pool } = require("pg");
 
@@ -13,13 +12,9 @@ const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 
 // ==================================================================
 // ⚠️⚠️⚠️ 请在此处填入你的图片 File ID ⚠️⚠️⚠️
-// (部署后通过 /admin 获取，然后回来填入，再次部署)
 // ==================================================================
 
-// 1. 收款码图片 ID (用户点击"升级会员"时显示)
 const PAYMENT_QR_FILE_ID = ""; 
-
-// 2. 订单号示例图片 ID (用户点击"我已付款"后显示)
 const ORDER_EXAMPLE_FILE_ID = "";
 
 // ==================================================================
@@ -27,7 +22,6 @@ const ORDER_EXAMPLE_FILE_ID = "";
 
 // --- 辅助函数 ---
 
-// 获取北京时间当前日期 (格式: YYYY-MM-DD)
 function getBeijingDate() {
   return new Date().toLocaleDateString("zh-CN", {
     timeZone: "Asia/Shanghai",
@@ -37,12 +31,10 @@ function getBeijingDate() {
   }).replace(/\//g, '-');
 }
 
-// 确保用户存在，并处理每日重置逻辑
 async function getOrInitUser(ctx) {
   const user = ctx.from;
   const today = getBeijingDate();
 
-  // 1. 尝试插入用户
   await pool.query(
     `INSERT INTO users (telegram_id, username, first_name, daily_count, last_activity_date, is_vip, payment_attempts)
      VALUES ($1, $2, $3, 0, $4, FALSE, 0)
@@ -50,13 +42,10 @@ async function getOrInitUser(ctx) {
     [user.id, user.username, user.first_name, today]
   );
 
-  // 2. 获取当前用户数据
   let res = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [user.id]);
   let userData = res.rows[0];
 
-  // 3. 检查日期是否跨天 (北京时间)
   if (userData.last_activity_date !== today) {
-    // 重置每日计数
     await pool.query(
       "UPDATE users SET daily_count = 0, last_activity_date = $1 WHERE telegram_id = $2",
       [today, user.id]
@@ -64,16 +53,13 @@ async function getOrInitUser(ctx) {
     userData.daily_count = 0;
     userData.last_activity_date = today;
   }
-
   return userData;
 }
 
-// 增加用户兑换次数
 async function incrementUserCount(userId) {
   await pool.query("UPDATE users SET daily_count = daily_count + 1 WHERE telegram_id = $1", [userId]);
 }
 
-// 状态管理
 async function setState(userId, state, tempData = null) {
   await pool.query(
     `INSERT INTO user_states (user_id, state, temp_data) VALUES ($1, $2, $3)
@@ -91,7 +77,6 @@ async function clearState(userId) {
   await pool.query("DELETE FROM user_states WHERE user_id = $1", [userId]);
 }
 
-// 分页键盘生成器
 function createPaginationKeyboard(currentPage, totalCount, prefix) {
   const totalPages = Math.ceil(totalCount / 10);
   const keyboard = new InlineKeyboard();
@@ -107,7 +92,56 @@ function createPaginationKeyboard(currentPage, totalCount, prefix) {
   return row;
 }
 
-// --- 统一的首页显示逻辑 ---
+// --- 核心逻辑封装 ---
+
+// 统一的兑换处理函数 (支持链接直达和按钮点击)
+async function tryRedeemProduct(ctx, productId, isFromLink = false) {
+  const userData = await getOrInitUser(ctx);
+  
+  // 1. 检查额度
+  if (!userData.is_vip && userData.daily_count >= 3) {
+    const limitKeyboard = new InlineKeyboard().text("👑 立即升级 VIP (无限次)", "vip_info");
+    const msg = "🚫 **今日免费次数已用完** (3/3)\n\n升级会员即可解锁 **永久无限次** 兑换特权！";
+    
+    if (ctx.callbackQuery) {
+        await ctx.reply(msg, { reply_markup: limitKeyboard, parse_mode: "Markdown" });
+        return ctx.answerCallbackQuery({ text: "次数已用完，请升级会员！", show_alert: false });
+    } else {
+        return ctx.reply(msg, { reply_markup: limitKeyboard, parse_mode: "Markdown" });
+    }
+  }
+
+  // 2. 查询商品
+  const prodRes = await pool.query("SELECT * FROM products WHERE id = $1", [productId]);
+  if (prodRes.rows.length === 0) {
+    const msg = "⚠️ 商品不存在或已下架";
+    if (ctx.callbackQuery) {
+        return ctx.answerCallbackQuery({ text: msg, show_alert: true });
+    } else {
+        return ctx.reply(msg);
+    }
+  }
+  const product = prodRes.rows[0];
+
+  // 3. 扣除次数并发送
+  await incrementUserCount(ctx.from.id);
+  
+  await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: \`${product.content}\`\n\n(点击内容可复制)`, { parse_mode: "Markdown" });
+  
+  if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "兑换成功！" });
+      // 按钮点击本身就在 /dh，刷新一下即可
+      await showRedeemPage(ctx, 1); 
+  } else {
+      // 如果是从链接 (get_123) 进来的，发完货后，自动跳转到 /dh 列表
+      if (isFromLink) {
+          await showRedeemPage(ctx, 1);
+      }
+  }
+}
+
+// --- 页面显示逻辑 ---
+
 async function showStartPage(ctx) {
   await getOrInitUser(ctx);
   const keyboard = new InlineKeyboard()
@@ -123,10 +157,8 @@ async function showStartPage(ctx) {
 请选择下方功能：
   `;
 
-  // 判断是回调更新还是发送新消息
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
-        // 如果之前是图片，删除重发
         await ctx.deleteMessage().catch(()=>{});
         await ctx.reply(welcomeText, { reply_markup: keyboard, parse_mode: "Markdown" });
     } else {
@@ -137,29 +169,21 @@ async function showStartPage(ctx) {
   }
 }
 
-// --- 业务逻辑 ---
-
-// 1. /start 首页
-bot.command("start", async (ctx) => {
-    await showStartPage(ctx);
-});
-
-// 2. VIP 介绍页 (显示收款码)
-bot.callbackQuery("vip_info", async (ctx) => {
+async function showVipPage(ctx) {
   const userData = await getOrInitUser(ctx);
   
-  // 检查是否被锁定
   const now = new Date();
   if (userData.payment_lockout_until && new Date(userData.payment_lockout_until) > now) {
       const diff = Math.ceil((new Date(userData.payment_lockout_until) - now) / 60000);
-      return ctx.answerCallbackQuery({ 
-          text: `⚠️ 系统繁忙，请 ${diff} 分钟后再试。`, 
-          show_alert: true 
-      });
+      const msg = `⚠️ 系统繁忙，请 ${diff} 分钟后再试。`;
+      if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text: msg, show_alert: true });
+      else return ctx.reply(msg);
   }
 
   if (userData.is_vip) {
-      return ctx.answerCallbackQuery({ text: "尊贵的会员，您已经是永久 VIP 了！", show_alert: true });
+      const msg = "尊贵的会员，您已经是永久 VIP 了！";
+      if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text: msg, show_alert: true });
+      else return ctx.reply("🎉 " + msg);
   }
 
   const keyboard = new InlineKeyboard()
@@ -179,32 +203,64 @@ bot.callbackQuery("vip_info", async (ctx) => {
   `;
 
   if (PAYMENT_QR_FILE_ID && PAYMENT_QR_FILE_ID.length > 5) {
-      await ctx.deleteMessage().catch(()=>{});
-      await ctx.replyWithPhoto(PAYMENT_QR_FILE_ID, {
-          caption: caption,
-          parse_mode: "Markdown",
-          reply_markup: keyboard
-      });
+      if (ctx.callbackQuery) {
+          await ctx.deleteMessage().catch(()=>{});
+          await ctx.replyWithPhoto(PAYMENT_QR_FILE_ID, { caption: caption, parse_mode: "Markdown", reply_markup: keyboard });
+      } else {
+          await ctx.replyWithPhoto(PAYMENT_QR_FILE_ID, { caption: caption, parse_mode: "Markdown", reply_markup: keyboard });
+      }
   } else {
-      await ctx.editMessageText(caption + "\n(⚠️ 管理员未设置收款码图片)", { 
-          reply_markup: keyboard, 
-          parse_mode: "Markdown" 
-      });
+      const text = caption + "\n(⚠️ 管理员未设置收款码图片)";
+      if (ctx.callbackQuery) {
+          await ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: "Markdown" }).catch(()=>{});
+      } else {
+          await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
+      }
   }
+}
+
+// --- 路由与命令处理 ---
+
+// 1. /start 命令
+bot.command("start", async (ctx) => {
+    const payload = ctx.match; 
+
+    if (payload === "vip") {
+        await showVipPage(ctx);
+    } 
+    else if (payload === "dh") {
+        await showRedeemPage(ctx, 1);
+    } 
+    else if (payload && payload.startsWith("get_")) {
+        const productId = payload.replace("get_", ""); 
+        if (/^\d+$/.test(productId)) {
+            // 参数 true 表示这是从链接进来的，发货后要跳到 /dh
+            await tryRedeemProduct(ctx, productId, true);
+        } else {
+            await ctx.reply("⚠️ 无效的商品链接");
+            await showStartPage(ctx);
+        }
+    } 
+    else {
+        await showStartPage(ctx);
+    }
 });
 
-// 返回首页回调
+// 2. VIP 按钮回调
+bot.callbackQuery("vip_info", async (ctx) => {
+  await showVipPage(ctx);
+});
+
 bot.callbackQuery("back_to_start", async (ctx) => {
     await showStartPage(ctx);
 });
 
-// 处理文字输入时的“返回首页”按钮
 bot.callbackQuery("back_to_start_msg", async (ctx) => {
     await ctx.deleteMessage().catch(()=>{});
     await showStartPage(ctx);
 });
 
-// 3. 点击“我已付款” -> 进入等待订单号状态
+// 3. 点击“我已付款”
 bot.callbackQuery("vip_paid_check", async (ctx) => {
     const userId = ctx.from.id;
     const userData = await getOrInitUser(ctx);
@@ -286,7 +342,6 @@ async function showRedeemPage(ctx, page) {
   const navRow = createPaginationKeyboard(page, totalCount, "dh");
   keyboard.row(...navRow);
 
-  // 如果不是VIP，增加升级按钮
   if (!isVip) {
       keyboard.row().text("👑 升级永久会员 (无限兑换)", "vip_info");
   }
@@ -308,48 +363,22 @@ async function showRedeemPage(ctx, page) {
 bot.command("dh", (ctx) => showRedeemPage(ctx, 1));
 bot.callbackQuery(/dh_page_(\d+)/, (ctx) => showRedeemPage(ctx, parseInt(ctx.match[1])));
 
-// 兑换核心逻辑
+// 兑换回调 (按钮点击，不是链接进来的)
 bot.callbackQuery(/try_redeem_(\d+)/, async (ctx) => {
   const productId = ctx.match[1];
-  const userData = await getOrInitUser(ctx);
-  
-  // 检查额度
-  if (!userData.is_vip && userData.daily_count >= 3) {
-    const limitKeyboard = new InlineKeyboard()
-        .text("👑 立即升级 VIP (无限次)", "vip_info");
-    
-    await ctx.reply("🚫 **今日免费次数已用完** (3/3)\n\n升级会员即可解锁 **永久无限次** 兑换特权！", { 
-        reply_markup: limitKeyboard,
-        parse_mode: "Markdown" 
-    });
-    
-    return ctx.answerCallbackQuery({
-      text: "次数已用完，请升级会员！",
-      show_alert: false 
-    });
-  }
-
-  const prodRes = await pool.query("SELECT * FROM products WHERE id = $1", [productId]);
-  if (prodRes.rows.length === 0) {
-    return ctx.answerCallbackQuery({ text: "⚠️ 商品已下架", show_alert: true });
-  }
-  const product = prodRes.rows[0];
-
-  await incrementUserCount(ctx.from.id);
-  
-  await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: \`${product.content}\`\n\n(点击内容可复制)`, { parse_mode: "Markdown" });
-  await ctx.answerCallbackQuery({ text: "兑换成功！" });
-  await showRedeemPage(ctx, 1); 
+  await tryRedeemProduct(ctx, productId, false);
 });
 
-// 5. /c 取消
+// 5. /c 取消 -> 自动跳转 Admin
 bot.command("c", async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   await clearState(ctx.from.id);
+  // 取消后，直接调用显示后台面板函数
   await ctx.reply("🚫 **操作已取消**", { parse_mode: "Markdown" });
+  await showAdminPanel(ctx);
 });
 
-// 6. /admin 后台
+// 6. /admin 后台主页
 bot.command("admin", (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   showAdminPanel(ctx);
@@ -358,8 +387,8 @@ bot.command("admin", (ctx) => {
 function showAdminPanel(ctx) {
   const keyboard = new InlineKeyboard()
     .text("📂 File ID 工具", "admin_fileid").row()
-    .text("🛍️ 商品上架管理 (/sj)", "sj_page_1");
-  const text = "🔧 **后台管理面板**\n━━━━━━━━━━━━━━\n输入 /c 可随时取消当前操作。";
+    .text("🛍️ 商品管理 (/a)", "sj_page_1"); // 菜单文字已更新
+  const text = "🔧 **后台管理面板**\n━━━━━━━━━━━━━━\n输入 /c 可随时取消并返回。";
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
         ctx.deleteMessage().catch(()=>{});
@@ -383,7 +412,7 @@ bot.callbackQuery("fid_get", async (ctx) => {
   ctx.editMessageText("📸 请发送一张图片...", { reply_markup: keyboard });
 });
 
-// Admin - 上架管理
+// 7. /a 商品管理 (原 /sj)
 async function showSjPage(ctx, page) {
   const offset = (page - 1) * 10;
   const countRes = await pool.query("SELECT COUNT(*) FROM products");
@@ -392,12 +421,12 @@ async function showSjPage(ctx, page) {
   const keyboard = new InlineKeyboard();
   keyboard.text("➕ 上架新商品", "sj_add_new").row();
   itemsRes.rows.forEach(item => {
-    keyboard.text(`❌ 删除: ${item.name}`, `sj_del_ask_${item.id}`).row();
+    keyboard.text(`❌ [${item.id}] ${item.name}`, `sj_del_ask_${item.id}`).row();
   });
   const navRow = createPaginationKeyboard(page, totalCount, "sj");
   keyboard.row(...navRow);
   keyboard.row().text("🔙 返回后台", "back_to_admin");
-  const text = `🛍️ **商品管理** (第 ${page} 页)`;
+  const text = `🛍️ **商品管理** (第 ${page} 页)\n商品名前的数字是ID，用于推广链接。`;
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
         ctx.deleteMessage().catch(()=>{});
@@ -409,8 +438,12 @@ async function showSjPage(ctx, page) {
     await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
   }
 }
-bot.command("sj", (ctx) => { if (ctx.from.id === ADMIN_ID) showSjPage(ctx, 1); });
+
+// 绑定 /a 命令
+bot.command("a", (ctx) => { if (ctx.from.id === ADMIN_ID) showSjPage(ctx, 1); });
+// 兼容旧的回调名称 sj_page 方便逻辑复用
 bot.callbackQuery(/sj_page_(\d+)/, (ctx) => showSjPage(ctx, parseInt(ctx.match[1])));
+
 bot.callbackQuery("sj_add_new", async (ctx) => {
   await setState(ctx.from.id, "awaiting_name");
   ctx.editMessageText("✏️ **请输入商品名称**：", { parse_mode: "Markdown" });
@@ -420,21 +453,22 @@ bot.callbackQuery(/sj_del_ask_(\d+)/, (ctx) => {
   const keyboard = new InlineKeyboard().text("✅ 确认删除", `sj_del_confirm_${id}`).text("🔙 取消", "sj_page_1");
   ctx.editMessageText("⚠️ **确认删除此商品吗？**", { reply_markup: keyboard, parse_mode: "Markdown" });
 });
+
+// 确认删除 -> 自动跳转回 /a
 bot.callbackQuery(/sj_del_confirm_(\d+)/, async (ctx) => {
   await pool.query("DELETE FROM products WHERE id = $1", [ctx.match[1]]);
   await ctx.answerCallbackQuery({ text: "🗑️ 删除成功" });
+  // 核心：直接调用显示列表函数
   showSjPage(ctx, 1);
 });
 
-// --- 消息监听 (包含万能回复逻辑) ---
+// --- 消息监听 ---
 bot.on("message", async (ctx) => {
   const userId = ctx.from.id;
   const userState = await getState(userId);
   const text = ctx.message.text || "";
 
-  // 1. 处理需要输入的特定状态 (优先级最高)
-  
-  // A. 订单号验证状态
+  // 1. 订单号验证状态
   if (userState.state === "awaiting_order_number") {
       const userData = await getOrInitUser(ctx);
       const now = new Date();
@@ -468,10 +502,10 @@ bot.on("message", async (ctx) => {
               return ctx.reply(`❌ **未查询到订单信息**\n\n请检查订单号是否正确，并重新发送。\n(剩余重试次数: ${2 - newAttempts} 次)`, { parse_mode: "Markdown" });
           }
       }
-      return; // 结束处理
+      return; 
   }
 
-  // B. 管理员状态
+  // 2. 管理员状态
   if (userId === ADMIN_ID && userState.state !== "idle") {
     if (userState.state === "awaiting_photo") {
       if (ctx.message.photo) {
@@ -493,14 +527,13 @@ bot.on("message", async (ctx) => {
         await pool.query("INSERT INTO products (name, content) VALUES ($1, $2)", [name, text]);
         await ctx.reply(`🎉 **上架成功！**`, { parse_mode: "Markdown" });
         await clearState(userId);
+        // 上架成功 -> 自动跳转回 /a
         showSjPage(ctx, 1);
         return;
     }
   }
 
-  // 2. 万能回复逻辑 (Fallback)
-  // 如果代码执行到这里，说明不是命令，也不是在特定状态下
-  // 直接显示首页
+  // 3. 万能回复
   await showStartPage(ctx);
 });
 
