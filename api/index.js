@@ -96,8 +96,7 @@ function createPaginationKeyboard(currentPage, totalCount, prefix) {
 // --- 核心逻辑封装 ---
 
 // 统一的兑换处理函数
-// isFromLink: 如果是真的，发完货后自动跳转到 /dh
-async function tryRedeemProduct(ctx, productId, isFromLink = false) {
+async function tryRedeemProduct(ctx, productId) {
   const userData = await getOrInitUser(ctx);
   
   // 1. 检查额度
@@ -128,16 +127,15 @@ async function tryRedeemProduct(ctx, productId, isFromLink = false) {
   // 3. 扣除次数并发送
   await incrementUserCount(ctx.from.id);
   
-  // 【修改点】：去掉了内容周围的 ` ` 反引号，取消了点击复制样式，只保留加粗
+  // 【修改点】：内容只加粗 (**内容**)，不使用代码块，取消点击复制
   await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: **${product.content}**`, { parse_mode: "Markdown" });
   
+  // 4. 发货完成后，统一跳转到 /dh 列表页
   if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: "兑换成功！" });
-      // 按钮点击本身就在 /dh，刷新一下即可
       await showRedeemPage(ctx, 1); 
   } else {
-      // 如果是从链接 (get_123) 进来的，发完货后，自动跳转到 /dh 列表
-      // 不管 isFromLink 是啥，只要是兑换成功都展示列表比较友好
+      // 这里的 else 主要是针对 get_链接 进来的情况
       await showRedeemPage(ctx, 1);
   }
 }
@@ -236,8 +234,8 @@ bot.command("start", async (ctx) => {
     else if (payload && payload.startsWith("get_")) {
         const productId = payload.replace("get_", ""); 
         if (/^\d+$/.test(productId)) {
-            // 参数 true 表示这是从链接进来的
-            await tryRedeemProduct(ctx, productId, true);
+            // 通过链接进来的，tryRedeemProduct 内部处理完会自动跳转到 /dh
+            await tryRedeemProduct(ctx, productId);
         } else {
             await ctx.reply("⚠️ 无效的商品链接");
             await showStartPage(ctx);
@@ -251,7 +249,6 @@ bot.command("start", async (ctx) => {
 // 【新增】/cz 重置管理员状态
 bot.command("cz", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
-    // 重置当前管理员的：次数、VIP状态、错误尝试、锁定时间
     await pool.query(
         "UPDATE users SET daily_count = 0, is_vip = FALSE, payment_attempts = 0, payment_lockout_until = NULL WHERE telegram_id = $1",
         [ADMIN_ID]
@@ -379,7 +376,7 @@ bot.callbackQuery(/dh_page_(\d+)/, (ctx) => showRedeemPage(ctx, parseInt(ctx.mat
 // 兑换回调
 bot.callbackQuery(/try_redeem_(\d+)/, async (ctx) => {
   const productId = ctx.match[1];
-  await tryRedeemProduct(ctx, productId, false);
+  await tryRedeemProduct(ctx, productId);
 });
 
 // 5. /c 取消 -> 自动跳转 Admin
@@ -425,8 +422,11 @@ bot.callbackQuery("fid_get", async (ctx) => {
   ctx.editMessageText("📸 请发送一张图片...", { reply_markup: keyboard });
 });
 
-// 7. /a 商品管理
+// 7. /a 商品管理 (修复无反应问题：确保回调逻辑匹配)
 async function showSjPage(ctx, page) {
+  // 如果是回调触发，先回答以消除转圈
+  if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(()=>{});
+
   const offset = (page - 1) * 10;
   const countRes = await pool.query("SELECT COUNT(*) FROM products");
   const totalCount = parseInt(countRes.rows[0].count);
@@ -440,7 +440,10 @@ async function showSjPage(ctx, page) {
   const navRow = createPaginationKeyboard(page, totalCount, "sj");
   keyboard.row(...navRow);
   keyboard.row().text("🔙 返回后台", "back_to_admin");
-  const text = `🛍️ **商品管理** (第 ${page} 页)\n商品名前的数字是ID，用于推广链接 (get_ID)。`;
+  
+  // 在这里告诉管理员链接格式
+  const text = `🛍️ **商品管理** (第 ${page} 页)\n\n🔗 **单品推广链接格式**：\n\`https://t.me/${ctx.me.username}?start=get_商品ID\``;
+  
   if (ctx.callbackQuery) {
     if (ctx.callbackQuery.message.photo) {
         ctx.deleteMessage().catch(()=>{});
@@ -455,7 +458,7 @@ async function showSjPage(ctx, page) {
 
 // 绑定 /a 命令
 bot.command("a", (ctx) => { if (ctx.from.id === ADMIN_ID) showSjPage(ctx, 1); });
-// 兼容旧的回调名称 sj_page 方便逻辑复用
+// 兼容旧的回调名称 sj_page
 bot.callbackQuery(/sj_page_(\d+)/, (ctx) => showSjPage(ctx, parseInt(ctx.match[1])));
 
 bot.callbackQuery("sj_add_new", async (ctx) => {
@@ -472,7 +475,6 @@ bot.callbackQuery(/sj_del_ask_(\d+)/, (ctx) => {
 bot.callbackQuery(/sj_del_confirm_(\d+)/, async (ctx) => {
   await pool.query("DELETE FROM products WHERE id = $1", [ctx.match[1]]);
   await ctx.answerCallbackQuery({ text: "🗑️ 删除成功" });
-  // 核心：直接调用显示列表函数
   showSjPage(ctx, 1);
 });
 
@@ -522,19 +524,17 @@ bot.on("message", async (ctx) => {
   // 2. 管理员状态
   if (userId === ADMIN_ID && userState.state !== "idle") {
     
-    // 【修改点】修复死机问题：回复ID时不使用 Markdown 格式，防止符号报错；并立即 return
+    // 图片 ID 获取 (修复死机问题)
     if (userState.state === "awaiting_photo") {
       if (ctx.message.photo) {
         const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-        // 使用普通文本回复 ID，避免 Markdown 错误
         await ctx.reply(`File ID (请复制): \n${fileId}`);
-        // 立即清空状态
         await clearState(userId);
         await ctx.reply("✅ ID 获取成功，状态已重置。");
       } else {
         await ctx.reply("⚠️ 请发送图片，或输入 /c 取消。");
       }
-      return; // 阻断后续逻辑
+      return;
     } 
     else if (userState.state === "awaiting_name") {
         await setState(userId, "awaiting_content", text);
