@@ -15,8 +15,8 @@ const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 // (部署后通过 /admin -> File ID 工具获取)
 // ==================================================================
 
-const PAYMENT_QR_FILE_ID = ""; 
-const ORDER_EXAMPLE_FILE_ID = "";
+const PAYMENT_QR_FILE_ID = "AgACAgUAAxkBAAIBHGmANSrPR630YXg6SGMZta7YmqlWAAK_DmsbJxgBVBCDF6PaxLrrAQADAgADeQADOAQ"; 
+const ORDER_EXAMPLE_FILE_ID = "AgACAgUAAxkBAAIBH2mANS5zbMzo4GQpCcWg9BySi0KnAALADmsbJxgBVFp7MfXalvoXAQADAgADeQADOAQ";
 
 // ==================================================================
 
