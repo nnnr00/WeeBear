@@ -1,13 +1,14 @@
 {
-  "crons": [
-    {
-      "path": "/api/index?cron=true",
-      "schedule": "* * * * *"
-    }
-  ],
-  "functions": {
-    "api/index.js": {
-      "maxDuration": 60
-    }
+  "name": "telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram Bot",
+  "main": "api/index.js",
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "pg": "^8.11.3",
+    "moment-timezone": "^0.5.45"
+  },
+  "engines": {
+    "node": "18.x"
   }
 }
