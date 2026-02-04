@@ -1,559 +1,639 @@
-const { Bot, webhookCallback, InlineKeyboard } = require("grammy");
-const { Pool } = require("pg");
+// api/index.js
+const { Telegraf, Markup } = require('telegraf');
+const { Pool } = require('pg');
+const moment = require('moment-timezone');
 
-// --- 基础配置 ---
+// ==========================================
+// 1. 数据库连接 (Neon PostgreSQL)
+// ==========================================
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: true,
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
-const bot = new Bot(process.env.BOT_TOKEN);
+const query = async (text, params) => await pool.query(text, params);
+
+// ==========================================
+// 2. 初始化与配置
+// ==========================================
+const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 
-// ==================================================================
-// ⚠️⚠️⚠️ 请在此处填入你的图片 File ID ⚠️⚠️⚠️
-// (部署后通过 /admin -> File ID 工具获取)
-// ==================================================================
+// 🔴 🔴 🔴 配置区：部署后请用 /admin 获取 File ID 填入此处 🔴 🔴 🔴
+const CONFIG = {
+    // 首次验证 /y 图片 (2张)
+    y_images: [
+        'AgACAgUAAxkBAAIxxxx1', 
+        'AgACAgUAAxkBAAIxxxx2'
+    ],
+    // 二次验证 /yz 图片 (3张)
+    yz_images: [
+        'AgACAgUAAxkBAAIxxxx3',
+        'AgACAgUAAxkBAAIxxxx4',
+        'AgACAgUAAxkBAAIxxxx5'
+    ],
+    // VIP 特权说明图片 (1张)
+    vip_info_image: 'AgACAgUAAxkBAAIxxxx6', 
+    // 查找订单号教程图片 (1张)
+    order_tutorial_image: 'AgACAgUAAxkBAAIxxxx7',
+    // 支付成功后的加群链接
+    vip_group_link: 'https://t.me/+495j5rWmApsxYzg9' 
+};
 
-const PAYMENT_QR_FILE_ID = "AgACAgUAAxkBAAIBHGmANSrPR630YXg6SGMZta7YmqlWAAK_DmsbJxgBVBCDF6PaxLrrAQADAgADeQADOAQ"; 
-const ORDER_EXAMPLE_FILE_ID = "AgACAgUAAxkBAAIBH2mANS5zbMzo4GQpCcWg9BySi0KnAALADmsbJxgBVFp7MfXalvoXAQADAgADeQADOAQ";
+// ==========================================
+// 3. 全局中间件
+// ==========================================
+bot.use(async (ctx, next) => {
+    if (!ctx.from) return next();
 
-// ==================================================================
+    const chatId = ctx.from.id;
+    const today = moment().tz('Asia/Shanghai').format('YYYY-MM-DD');
 
+    // 1. 获取或创建用户
+    let res = await query('SELECT * FROM users WHERE chat_id = $1', [chatId]);
+    let user = res.rows[0];
 
-// --- 辅助函数 ---
-
-function getBeijingDate() {
-  return new Date().toLocaleDateString("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).replace(/\//g, '-');
-}
-
-async function getOrInitUser(ctx) {
-  const user = ctx.from;
-  const today = getBeijingDate();
-
-  await pool.query(
-    `INSERT INTO users (telegram_id, username, first_name, daily_count, last_activity_date, is_vip, payment_attempts)
-     VALUES ($1, $2, $3, 0, $4, FALSE, 0)
-     ON CONFLICT (telegram_id) DO NOTHING`,
-    [user.id, user.username, user.first_name, today]
-  );
-
-  let res = await pool.query("SELECT * FROM users WHERE telegram_id = $1", [user.id]);
-  let userData = res.rows[0];
-
-  if (userData.last_activity_date !== today) {
-    await pool.query(
-      "UPDATE users SET daily_count = 0, last_activity_date = $1 WHERE telegram_id = $2",
-      [today, user.id]
-    );
-    userData.daily_count = 0;
-    userData.last_activity_date = today;
-  }
-  return userData;
-}
-
-async function incrementUserCount(userId) {
-  await pool.query("UPDATE users SET daily_count = daily_count + 1 WHERE telegram_id = $1", [userId]);
-}
-
-async function setState(userId, state, tempData = null) {
-  await pool.query(
-    `INSERT INTO user_states (user_id, state, temp_data) VALUES ($1, $2, $3)
-     ON CONFLICT (user_id) DO UPDATE SET state = $2, temp_data = $3`,
-    [userId, state, tempData]
-  );
-}
-
-async function getState(userId) {
-  const res = await pool.query("SELECT * FROM user_states WHERE user_id = $1", [userId]);
-  return res.rows[0] || { state: "idle", temp_data: null };
-}
-
-async function clearState(userId) {
-  await pool.query("DELETE FROM user_states WHERE user_id = $1", [userId]);
-}
-
-function createPaginationKeyboard(currentPage, totalCount, prefix) {
-  const totalPages = Math.ceil(totalCount / 10);
-  const keyboard = new InlineKeyboard();
-  const row = [];
-  
-  if (currentPage > 1) {
-    row.push({ text: "⬅️ 上一页", callback_data: `${prefix}_page_${currentPage - 1}` });
-  }
-  row.push({ text: `📄 ${currentPage}/${totalPages || 1}`, callback_data: "noop" });
-  if (currentPage < totalPages) {
-    row.push({ text: "下一页 ➡️", callback_data: `${prefix}_page_${currentPage + 1}` });
-  }
-  return row;
-}
-
-// --- 核心逻辑封装 ---
-
-// 统一的兑换处理函数
-async function tryRedeemProduct(ctx, productId) {
-  const userData = await getOrInitUser(ctx);
-  
-  // 1. 检查额度
-  if (!userData.is_vip && userData.daily_count >= 3) {
-    const limitKeyboard = new InlineKeyboard().text("👑 立即升级 VIP (无限次)", "vip_info");
-    const msg = "🚫 **今日免费次数已用完** (3/3)\n\n升级会员即可解锁 **永久无限次** 兑换特权！";
-    
-    if (ctx.callbackQuery) {
-        await ctx.reply(msg, { reply_markup: limitKeyboard, parse_mode: "Markdown" });
-        return ctx.answerCallbackQuery({ text: "次数已用完，请升级会员！", show_alert: false });
-    } else {
-        return ctx.reply(msg, { reply_markup: limitKeyboard, parse_mode: "Markdown" });
+    if (!user) {
+        await query(
+            `INSERT INTO users (chat_id, username, first_name, last_verify_date) 
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [chatId, ctx.from.username, ctx.from.first_name, '']
+        );
+        res = await query('SELECT * FROM users WHERE chat_id = $1', [chatId]);
+        user = res.rows[0];
     }
-  }
 
-  // 2. 查询商品
-  const prodRes = await pool.query("SELECT * FROM products WHERE id = $1", [productId]);
-  if (prodRes.rows.length === 0) {
-    const msg = "⚠️ 商品不存在或已下架";
-    if (ctx.callbackQuery) {
-        return ctx.answerCallbackQuery({ text: msg, show_alert: true });
-    } else {
-        return ctx.reply(msg);
+    // 2. 每日重置逻辑 (北京时间 00:00)
+    // 只要日期变了，重置首次验证状态
+    if (user.last_verify_date !== today) {
+        await query(
+            `UPDATE users SET first_verify_status = $1, last_verify_date = $2, download_count = 0 WHERE chat_id = $3`,
+            [false, today, chatId]
+        );
+        user.first_verify_status = false;
+        user.last_verify_date = today;
     }
-  }
-  const product = prodRes.rows[0];
 
-  // 3. 扣除次数并发送
-  await incrementUserCount(ctx.from.id);
-  
-  // 【修改点】：内容只加粗 (**内容**)，不使用代码块，取消点击复制
-  await ctx.reply(`🎉 **兑换成功**\n\n📦 **商品**: ${product.name}\n🔑 **内容**: **${product.content}**`, { parse_mode: "Markdown" });
-  
-  // 4. 发货完成后，统一跳转到 /dh 列表页
-  if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: "兑换成功！" });
-      await showRedeemPage(ctx, 1); 
-  } else {
-      // 这里的 else 主要是针对 get_链接 进来的情况
-      await showRedeemPage(ctx, 1);
-  }
-}
-
-// --- 页面显示逻辑 ---
-
-async function showStartPage(ctx) {
-  await getOrInitUser(ctx);
-  const keyboard = new InlineKeyboard()
-    .text("🎁 进入兑换中心", "dh_page_1").row()
-    .text("👑 升级永久会员 (无限兑换)", "vip_info");
-
-  const welcomeText = `
-👋 **欢迎使用小卫网盘兑换系统**
-
-👤 **普通用户**: 每日免费 **3** 次
-👑 **升级会员**: 永久 **无限次** 兑换
-
-请选择下方功能：
-  `;
-
-  if (ctx.callbackQuery) {
-    if (ctx.callbackQuery.message.photo) {
-        await ctx.deleteMessage().catch(()=>{});
-        await ctx.reply(welcomeText, { reply_markup: keyboard, parse_mode: "Markdown" });
-    } else {
-        await ctx.editMessageText(welcomeText, { reply_markup: keyboard, parse_mode: "Markdown" }).catch(()=>{});
-    }
-  } else {
-    await ctx.reply(welcomeText, { reply_markup: keyboard, parse_mode: "Markdown" });
-  }
-}
-
-async function showVipPage(ctx) {
-  const userData = await getOrInitUser(ctx);
-  
-  const now = new Date();
-  if (userData.payment_lockout_until && new Date(userData.payment_lockout_until) > now) {
-      const diff = Math.ceil((new Date(userData.payment_lockout_until) - now) / 60000);
-      const msg = `⚠️ 系统繁忙，请 ${diff} 分钟后再试。`;
-      if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text: msg, show_alert: true });
-      else return ctx.reply(msg);
-  }
-
-  if (userData.is_vip) {
-      const msg = "尊贵的会员，您已经是永久 VIP 了！";
-      if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text: msg, show_alert: true });
-      else return ctx.reply("🎉 " + msg);
-  }
-
-  const keyboard = new InlineKeyboard()
-    .text("✅ 我已付款", "vip_paid_check").row()
-    .text("🔙 返回首页", "back_to_start");
-
-  const caption = `
-💎 **会员特权说明**
-
-👤 **普通用户**: 每日免费兑换 **3** 次
-👑 **永久会员**: 解锁 **无限次** 兑换特权
-
-━━━━━━━━━━━━━━
-💰 **付款说明**:
-请扫描上方二维码付款。
-付款后，请点击下方【我已付款】按钮进行自动核验。
-  `;
-
-  if (PAYMENT_QR_FILE_ID && PAYMENT_QR_FILE_ID.length > 5) {
-      if (ctx.callbackQuery) {
-          await ctx.deleteMessage().catch(()=>{});
-          await ctx.replyWithPhoto(PAYMENT_QR_FILE_ID, { caption: caption, parse_mode: "Markdown", reply_markup: keyboard });
-      } else {
-          await ctx.replyWithPhoto(PAYMENT_QR_FILE_ID, { caption: caption, parse_mode: "Markdown", reply_markup: keyboard });
-      }
-  } else {
-      const text = caption + "\n(⚠️ 管理员未设置收款码图片)";
-      if (ctx.callbackQuery) {
-          await ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: "Markdown" }).catch(()=>{});
-      } else {
-          await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-      }
-  }
-}
-
-// --- 路由与命令处理 ---
-
-// 1. /start 命令 (支持 vip, hy, dh, get_123)
-bot.command("start", async (ctx) => {
-    const payload = ctx.match; 
-
-    if (payload === "vip" || payload === "hy") {
-        await showVipPage(ctx);
-    } 
-    else if (payload === "dh") {
-        await showRedeemPage(ctx, 1);
-    } 
-    else if (payload && payload.startsWith("get_")) {
-        const productId = payload.replace("get_", ""); 
-        if (/^\d+$/.test(productId)) {
-            // 通过链接进来的，tryRedeemProduct 内部处理完会自动跳转到 /dh
-            await tryRedeemProduct(ctx, productId);
-        } else {
-            await ctx.reply("⚠️ 无效的商品链接");
-            await showStartPage(ctx);
+    // 3. 封禁检查
+    if (user.is_banned) {
+        // 允许 VIP 页面交互以便解封
+        const isVipAction = (ctx.message && ctx.message.text === '/v') || 
+                            (ctx.callbackQuery && ['btn_vip', 'btn_paid_verify'].includes(ctx.callbackQuery.data));
+        
+        if (isVipAction) {
+            ctx.user = user;
+            return next();
         }
-    } 
-    else {
-        await showStartPage(ctx);
-    }
-});
-
-// 【新增】/cz 重置管理员状态
-bot.command("cz", async (ctx) => {
-    if (ctx.from.id !== ADMIN_ID) return;
-    await pool.query(
-        "UPDATE users SET daily_count = 0, is_vip = FALSE, payment_attempts = 0, payment_lockout_until = NULL WHERE telegram_id = $1",
-        [ADMIN_ID]
-    );
-    await ctx.reply("✅ **测试模式：重置成功**\n\n您现在是：普通用户\n今日次数：0/3\n无锁定状态", { parse_mode: "Markdown" });
-});
-
-// 2. VIP 按钮回调
-bot.callbackQuery("vip_info", async (ctx) => {
-  await showVipPage(ctx);
-});
-
-bot.callbackQuery("back_to_start", async (ctx) => {
-    await showStartPage(ctx);
-});
-
-bot.callbackQuery("back_to_start_msg", async (ctx) => {
-    await ctx.deleteMessage().catch(()=>{});
-    await showStartPage(ctx);
-});
-
-// 3. 点击“我已付款”
-bot.callbackQuery("vip_paid_check", async (ctx) => {
-    const userId = ctx.from.id;
-    const userData = await getOrInitUser(ctx);
-
-    const now = new Date();
-    if (userData.payment_lockout_until && new Date(userData.payment_lockout_until) > now) {
-        await ctx.deleteMessage().catch(()=>{});
-        return ctx.reply("⚠️ **验证次数过多**\n\n为了安全起见，系统已暂时锁定验证功能。\n请 1 小时后再试。", { 
-            parse_mode: "Markdown",
-            reply_markup: new InlineKeyboard().text("🔙 返回首页", "back_to_start_msg")
-        });
+        
+        try {
+           await ctx.reply('⛔️ 你已被本活动封禁，请加入会员（特价版）', 
+               Markup.inlineKeyboard([[Markup.button.callback('💎 加入会员（新春特价）', 'btn_vip')]])
+           );
+        } catch(e) {}
+        return;
     }
 
-    await setState(userId, "awaiting_order_number");
-    
-    const text = `
-🧾 **订单号核验**
+    ctx.user = user;
+    await next();
+});
 
-请参考上方图片查找您的【支付宝订单号】：
+// ==========================================
+// 4. 基础命令 (/start, /dh)
+// ==========================================
 
-1. 打开支付宝 APP -> **【我的】**
-2. 点击 **【账单】**
-3. 找到交易，进入 **【账单详情】**
-4. 点击 **【更多】**
-5. 长按复制 **【订单号】**
+// /start
+bot.start(async (ctx) => {
+    // 每次回首页重置状态，防止卡死
+    await query("UPDATE users SET state = 'IDLE' WHERE chat_id = $1", [ctx.user.chat_id]);
 
-👉 **请直接在对话框回复您的订单号：**
-(剩余重试次数: ${2 - userData.payment_attempts} 次)
-    `;
+    const args = ctx.message.text.split(' ');
+    // 深层链接 start=dh
+    if (args.length > 1 && args[1] === 'dh') {
+        return sendDhPage(ctx, 1);
+    }
+
+    const welcomeText = `🧨 <b>喜迎二月除夕，新春快乐！</b> 🧨\n\n` +
+                        `本频道所有资源 <b>免费观看</b>！无套路！\n` +
+                        `只需要打开兑换中心，点击相应按钮即可直接观看。\n\n` +
+                        `👇 点击下方按钮开始 👇`;
+
+    await ctx.replyWithHTML(welcomeText, Markup.inlineKeyboard([
+        [Markup.button.callback('🧧 新春兑换中心', 'goto_dh')]
+    ]));
+});
+
+// /dh 兑换中心
+const sendDhPage = async (ctx, page = 1) => {
+    const limit = 10;
+    const offset = (page - 1) * limit;
     
-    const keyboard = new InlineKeyboard().text("🔙 取消", "back_to_start");
-    
-    if (ORDER_EXAMPLE_FILE_ID && ORDER_EXAMPLE_FILE_ID.length > 5) {
-        await ctx.deleteMessage().catch(()=>{});
-        await ctx.replyWithPhoto(ORDER_EXAMPLE_FILE_ID, {
-            caption: text,
-            parse_mode: "Markdown",
-            reply_markup: keyboard
-        });
-    } else {
-        if (ctx.callbackQuery.message.photo) {
-            await ctx.deleteMessage().catch(()=>{});
-            await ctx.reply(text, { parse_mode: "Markdown", reply_markup: keyboard });
-        } else {
-            await ctx.editMessageText(text, { parse_mode: "Markdown", reply_markup: keyboard });
+    // 获取商品
+    const pRes = await query('SELECT keyword FROM products ORDER BY keyword LIMIT $1 OFFSET $2', [limit, offset]);
+    const products = pRes.rows;
+    const cRes = await query('SELECT COUNT(*) FROM products');
+    const total = parseInt(cRes.rows[0].count);
+    const totalPages = Math.ceil(total / limit);
+
+    let buttons = [];
+    let row = [];
+    products.forEach((p) => {
+        row.push(Markup.button.callback(p.keyword, `prod_${p.keyword}`));
+        if (row.length === 2) {
+            buttons.push(row);
+            row = [];
         }
-    }
-});
-
-
-// 4. /dh 兑换页面
-async function showRedeemPage(ctx, page) {
-  const userData = await getOrInitUser(ctx);
-  const count = userData.daily_count;
-  const isVip = userData.is_vip;
-
-  let userHeader = "";
-  if (isVip) {
-      userHeader = `👤 **用户**: ${userData.first_name || 'Guest'} (👑 VIP)\n🆔 **ID**: \`${userData.telegram_id}\`\n♾️ **额度**: 无限次兑换`;
-  } else {
-      userHeader = `👤 **用户**: ${userData.first_name || 'Guest'}\n🆔 **ID**: \`${userData.telegram_id}\` (${count}/3)`;
-  }
-
-  const offset = (page - 1) * 10;
-  const countRes = await pool.query("SELECT COUNT(*) FROM products");
-  const totalCount = parseInt(countRes.rows[0].count);
-  const itemsRes = await pool.query("SELECT id, name FROM products ORDER BY id DESC LIMIT 10 OFFSET $1", [offset]);
-  
-  const keyboard = new InlineKeyboard();
-  
-  if (itemsRes.rows.length === 0) {
-    keyboard.text("🌑 暂无上架商品", "noop").row();
-  } else {
-    itemsRes.rows.forEach(item => {
-      keyboard.text(`🎁 ${item.name}`, `try_redeem_${item.id}`).row();
     });
-  }
+    if (row.length > 0) buttons.push(row);
 
-  const navRow = createPaginationKeyboard(page, totalCount, "dh");
-  keyboard.row(...navRow);
+    // 翻页
+    let navRow = [];
+    if (page > 1) navRow.push(Markup.button.callback('⬅️ 上一页', `dh_page_${page - 1}`));
+    navRow.push(Markup.button.callback(`${page}/${totalPages || 1}`, 'noop'));
+    if (page < totalPages) navRow.push(Markup.button.callback('下一页 ➡️', `dh_page_${page + 1}`));
+    buttons.push(navRow);
 
-  if (!isVip) {
-      keyboard.row().text("👑 升级永久会员 (无限兑换)", "vip_info");
-  }
-  
-  const text = `${userHeader}\n━━━━━━━━━━━━━━\n📢 **提示**: 升级会员可无限次兑换。\n普通用户每日免费 **3** 次。\n\n🛒 **商品列表** (第 ${page} 页)\n请点击下方按钮进行兑换：`;
-
-  if (ctx.callbackQuery) {
-    if (ctx.callbackQuery.message.photo) {
-        await ctx.deleteMessage().catch(()=>{});
-        await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-    } else {
-        await ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: "Markdown" }).catch(()=>{});
-    }
-  } else {
-    await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-  }
-}
-
-bot.command("dh", (ctx) => showRedeemPage(ctx, 1));
-bot.callbackQuery(/dh_page_(\d+)/, (ctx) => showRedeemPage(ctx, parseInt(ctx.match[1])));
-
-// 兑换回调
-bot.callbackQuery(/try_redeem_(\d+)/, async (ctx) => {
-  const productId = ctx.match[1];
-  await tryRedeemProduct(ctx, productId);
-});
-
-// 5. /c 取消 -> 自动跳转 Admin
-bot.command("c", async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  await clearState(ctx.from.id);
-  // 取消后，直接调用显示后台面板函数
-  await ctx.reply("🚫 **操作已取消**", { parse_mode: "Markdown" });
-  await showAdminPanel(ctx);
-});
-
-// 6. /admin 后台主页
-bot.command("admin", (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  showAdminPanel(ctx);
-});
-
-function showAdminPanel(ctx) {
-  const keyboard = new InlineKeyboard()
-    .text("📂 File ID 工具", "admin_fileid").row()
-    .text("🛍️ 商品管理 (/a)", "sj_page_1");
-  const text = "🔧 **后台管理面板**\n━━━━━━━━━━━━━━\n输入 /c 可随时取消并返回。";
-  if (ctx.callbackQuery) {
-    if (ctx.callbackQuery.message.photo) {
-        ctx.deleteMessage().catch(()=>{});
-        ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-    } else {
-        ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: "Markdown" }).catch(() => {});
-    }
-  } else {
-    ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-  }
-}
-
-bot.callbackQuery("admin_fileid", (ctx) => {
-  const keyboard = new InlineKeyboard().text("📥 上传图片获取ID", "fid_get").text("🔙 返回", "back_to_admin");
-  ctx.editMessageText("📂 **File ID 工具**", { reply_markup: keyboard, parse_mode: "Markdown" });
-});
-bot.callbackQuery("back_to_admin", (ctx) => showAdminPanel(ctx));
-bot.callbackQuery("fid_get", async (ctx) => {
-  await setState(ctx.from.id, "awaiting_photo");
-  const keyboard = new InlineKeyboard().text("🔙 取消", "back_to_admin");
-  ctx.editMessageText("📸 请发送一张图片...", { reply_markup: keyboard });
-});
-
-// 7. /a 商品管理 (修复无反应问题：确保回调逻辑匹配)
-async function showSjPage(ctx, page) {
-  // 如果是回调触发，先回答以消除转圈
-  if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(()=>{});
-
-  const offset = (page - 1) * 10;
-  const countRes = await pool.query("SELECT COUNT(*) FROM products");
-  const totalCount = parseInt(countRes.rows[0].count);
-  const itemsRes = await pool.query("SELECT id, name FROM products ORDER BY id DESC LIMIT 10 OFFSET $1", [offset]);
-  const keyboard = new InlineKeyboard();
-  keyboard.text("➕ 上架新商品", "sj_add_new").row();
-  itemsRes.rows.forEach(item => {
-    // 按钮上显示ID，方便复制
-    keyboard.text(`❌ [${item.id}] ${item.name}`, `sj_del_ask_${item.id}`).row();
-  });
-  const navRow = createPaginationKeyboard(page, totalCount, "sj");
-  keyboard.row(...navRow);
-  keyboard.row().text("🔙 返回后台", "back_to_admin");
-  
-  // 在这里告诉管理员链接格式
-  const text = `🛍️ **商品管理** (第 ${page} 页)\n\n🔗 **单品推广链接格式**：\n\`https://t.me/${ctx.me.username}?start=get_商品ID\``;
-  
-  if (ctx.callbackQuery) {
-    if (ctx.callbackQuery.message.photo) {
-        ctx.deleteMessage().catch(()=>{});
-        ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-    } else {
-        ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-    }
-  } else {
-    await ctx.reply(text, { reply_markup: keyboard, parse_mode: "Markdown" });
-  }
-}
-
-// 绑定 /a 命令
-bot.command("a", (ctx) => { if (ctx.from.id === ADMIN_ID) showSjPage(ctx, 1); });
-// 兼容旧的回调名称 sj_page
-bot.callbackQuery(/sj_page_(\d+)/, (ctx) => showSjPage(ctx, parseInt(ctx.match[1])));
-
-bot.callbackQuery("sj_add_new", async (ctx) => {
-  await setState(ctx.from.id, "awaiting_name");
-  ctx.editMessageText("✏️ **请输入商品名称**：", { parse_mode: "Markdown" });
-});
-bot.callbackQuery(/sj_del_ask_(\d+)/, (ctx) => {
-  const id = ctx.match[1];
-  const keyboard = new InlineKeyboard().text("✅ 确认删除", `sj_del_confirm_${id}`).text("🔙 取消", "sj_page_1");
-  ctx.editMessageText("⚠️ **确认删除此商品吗？**", { reply_markup: keyboard, parse_mode: "Markdown" });
-});
-
-// 确认删除 -> 自动跳转回 /a
-bot.callbackQuery(/sj_del_confirm_(\d+)/, async (ctx) => {
-  await pool.query("DELETE FROM products WHERE id = $1", [ctx.match[1]]);
-  await ctx.answerCallbackQuery({ text: "🗑️ 删除成功" });
-  showSjPage(ctx, 1);
-});
-
-// --- 消息监听 ---
-bot.on("message", async (ctx) => {
-  const userId = ctx.from.id;
-  const userState = await getState(userId);
-  const text = ctx.message.text || "";
-
-  // 1. 订单号验证状态
-  if (userState.state === "awaiting_order_number") {
-      const userData = await getOrInitUser(ctx);
-      const now = new Date();
-      if (userData.payment_lockout_until && new Date(userData.payment_lockout_until) > now) {
-           await clearState(userId);
-           const keyboard = new InlineKeyboard().text("🔙 返回首页", "back_to_start_msg");
-           return ctx.reply("⚠️ 系统已锁定，请稍后再试。", { reply_markup: keyboard });
-      }
-
-      if (text.startsWith("4768")) {
-          await pool.query("UPDATE users SET is_vip = TRUE, payment_attempts = 0 WHERE telegram_id = $1", [userId]);
-          await clearState(userId);
-          const keyboard = new InlineKeyboard().text("🎁 立即去兑换", "dh_page_1");
-          return ctx.reply("🎉 **恭喜您！升级成功！**\n\n您现在是尊贵的永久 VIP 会员。\n享有 **无限次** 兑换特权。", { 
-              parse_mode: "Markdown", 
-              reply_markup: keyboard 
-          });
-      } else {
-          const newAttempts = (userData.payment_attempts || 0) + 1;
-          if (newAttempts >= 2) {
-              const lockoutTime = new Date(now.getTime() + 60 * 60 * 1000); 
-              await pool.query("UPDATE users SET payment_attempts = 0, payment_lockout_until = $1 WHERE telegram_id = $2", [lockoutTime.toISOString(), userId]);
-              await clearState(userId);
-              const keyboard = new InlineKeyboard().text("🔙 返回首页", "back_to_start_msg");
-              return ctx.reply("🚫 **验证失败次数过多**\n\n未查询到订单信息。\n为防止恶意尝试，系统已暂停您的验证功能。\n\n请 **1 小时后** 再次尝试。", { 
-                  parse_mode: "Markdown", 
-                  reply_markup: keyboard 
-              });
-          } else {
-              await pool.query("UPDATE users SET payment_attempts = $1 WHERE telegram_id = $2", [newAttempts, userId]);
-              return ctx.reply(`❌ **未查询到订单信息**\n\n请检查订单号是否正确，并重新发送。\n(剩余重试次数: ${2 - newAttempts} 次)`, { parse_mode: "Markdown" });
-          }
-      }
-      return; 
-  }
-
-  // 2. 管理员状态
-  if (userId === ADMIN_ID && userState.state !== "idle") {
+    // 底部核心按钮逻辑
+    let verifyBtnText = '🛡 开始验证';
+    let verifyAction = 'goto_verify_y';
     
-    // 图片 ID 获取 (修复死机问题)
-    if (userState.state === "awaiting_photo") {
-      if (ctx.message.photo) {
-        const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-        await ctx.reply(`File ID (请复制): \n${fileId}`);
-        await clearState(userId);
-        await ctx.reply("✅ ID 获取成功，状态已重置。");
-      } else {
-        await ctx.reply("⚠️ 请发送图片，或输入 /c 取消。");
-      }
-      return;
-    } 
-    else if (userState.state === "awaiting_name") {
-        await setState(userId, "awaiting_content", text);
-        await ctx.reply(`✅ 商品名: **${text}**\n\n📝 **请输入商品内容**：`, { parse_mode: "Markdown" });
-        return;
-    } 
-    else if (userState.state === "awaiting_content") {
-        const name = userState.temp_data;
-        await pool.query("INSERT INTO products (name, content) VALUES ($1, $2)", [name, text]);
-        await ctx.reply(`🎉 **上架成功！**`, { parse_mode: "Markdown" });
-        await clearState(userId);
-        // 上架成功 -> 自动跳转回 /a
-        await showSjPage(ctx, 1);
-        return;
+    // 如果已验证通过，或者已是VIP
+    if (ctx.user.first_verify_status || ctx.user.is_vip) {
+        verifyBtnText = '💎 加入会员（新春特价）';
+        verifyAction = 'btn_vip';
     }
-  }
 
-  // 3. 万能回复
-  await showStartPage(ctx);
+    buttons.push([Markup.button.callback(verifyBtnText, verifyAction)]);
+
+    const text = `<b>📀 资源兑换中心</b>\n\n` +
+                 `说明：点此对应的编号按钮，即可立马免费观看。\n` +
+                 `当前页码：${page}`;
+
+    try {
+        if (ctx.callbackQuery) {
+            await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+        } else {
+            await ctx.replyWithHTML(text, Markup.inlineKeyboard(buttons));
+        }
+    } catch (e) {
+        await ctx.replyWithHTML(text, Markup.inlineKeyboard(buttons));
+    }
+};
+
+bot.action(/dh_page_(\d+)/, async (ctx) => {
+    await sendDhPage(ctx, parseInt(ctx.match[1]));
+    await ctx.answerCbQuery();
 });
 
-module.exports = webhookCallback(bot, "http");
+bot.action('goto_dh', async (ctx) => {
+    await sendDhPage(ctx, 1);
+    await ctx.answerCbQuery();
+});
+
+// ==========================================
+// 5. VIP 支付验证逻辑 (核心修改)
+// ==========================================
+
+// /v 命令
+bot.command('v', async (ctx) => showVipPage(ctx));
+// 按钮入口
+bot.action('btn_vip', async (ctx) => {
+    await ctx.answerCbQuery();
+    await showVipPage(ctx);
+});
+
+// 步骤1：显示特权页
+const showVipPage = async (ctx) => {
+    const text = `<b>🧨 喜迎新春（特价）</b>\n\n` +
+                 `💎 <b>VIP会员特权说明：</b>\n` +
+                 `✅ 专属中转通道\n` +
+                 `✅ 优先审核入群\n` +
+                 `✅ 7x24小时客服支持\n` +
+                 `✅ 定期福利活动`;
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ 我已付款，开始验证', 'btn_paid_verify')]
+    ]);
+
+    try {
+        if (CONFIG.vip_info_image && CONFIG.vip_info_image.length > 5) {
+            await ctx.replyWithPhoto(CONFIG.vip_info_image, {
+                caption: text,
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else {
+            await ctx.replyWithHTML(text, keyboard);
+        }
+    } catch(e) { console.error(e); }
+};
+
+// 步骤2：显示找订单号教程
+bot.action('btn_paid_verify', async (ctx) => {
+    // 设置状态等待输入
+    await query("UPDATE users SET state = 'WAIT_PAYMENT_ORDER' WHERE chat_id = $1", [ctx.user.chat_id]);
+
+    const tutorialText = `<b>🔎 查找订单号详细教程</b>\n\n` +
+                         `1. 打开支付软件（支付宝/微信）\n` +
+                         `2. 点击 <b>我的</b> -> <b>账单</b>\n` +
+                         `3. 找到对应付款记录 -> <b>账单详情</b>\n` +
+                         `4. 点击 <b>更多</b> -> 复制 <b>订单号</b>\n\n` +
+                         `👇 <b>请在下方直接回复您的订单号：</b>\n` +
+                         `（系统自动识别，支持粘贴）`;
+
+    if (CONFIG.order_tutorial_image && CONFIG.order_tutorial_image.length > 5) {
+        await ctx.replyWithPhoto(CONFIG.order_tutorial_image, { caption: tutorialText, parse_mode: 'HTML' });
+    } else {
+        await ctx.replyWithHTML(tutorialText);
+    }
+    await ctx.answerCbQuery();
+});
+
+// ==========================================
+// 6. 验证流程逻辑 (/y, /yz, /dh确认)
+// ==========================================
+
+bot.action(/prod_(.+)/, async (ctx) => {
+    const keyword = ctx.match[1];
+    await ctx.editMessageText(`您选择了资源：<b>${keyword}</b>\n确认要兑换吗？`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[Markup.button.callback('❌ 取消', 'goto_dh'), Markup.button.callback('✅ 确认', `confirm_prod_${keyword}`)]] }
+    });
+    await ctx.answerCbQuery();
+});
+
+bot.action(/confirm_prod_(.+)/, async (ctx) => {
+    const keyword = ctx.match[1];
+    const user = ctx.user;
+
+    // VIP 直接通过
+    if (user.is_vip) {
+        return sendProduct(ctx, keyword);
+    }
+
+    // 1. 首次验证
+    if (!user.first_verify_status) {
+        return startFirstVerify(ctx);
+    }
+
+    // 2. 二次验证 (1小时后 OR 5次下载后)
+    if (!user.second_verify_done) {
+        const oneHour = 3600000;
+        const firstTime = user.first_verify_time ? new Date(user.first_verify_time).getTime() : 0;
+        const now = new Date().getTime();
+        
+        if ((now - firstTime > oneHour) || user.download_count >= 5) {
+            return startSecondVerify(ctx);
+        }
+    }
+
+    // 3. 发送资源
+    return sendProduct(ctx, keyword);
+});
+
+// 发送资源函数
+const sendProduct = async (ctx, keyword) => {
+    const res = await query('SELECT content FROM products WHERE keyword = $1', [keyword]);
+    if (res.rows.length === 0) return ctx.reply('⚠️ 资源不存在。');
+
+    // 计数
+    await query('UPDATE users SET download_count = download_count + 1 WHERE chat_id = $1', [ctx.user.chat_id]);
+
+    await ctx.reply(`正在发送资源：${keyword} ...`);
+    const contentList = res.rows[0].content;
+    const mediaGroup = [];
+    const sentMsgIds = [];
+
+    for (const item of contentList) {
+        if (item.type === 'text') {
+            const m = await ctx.reply(item.text);
+            sentMsgIds.push(m.message_id);
+        } else {
+            mediaGroup.push({ type: item.type, media: item.fileId });
+        }
+    }
+
+    if (mediaGroup.length > 0) {
+        const chunkSize = 10;
+        for (let i = 0; i < mediaGroup.length; i += chunkSize) {
+            const msgs = await ctx.replyWithMediaGroup(mediaGroup.slice(i, i + chunkSize));
+            msgs.forEach(m => sentMsgIds.push(m.message_id));
+        }
+    }
+
+    // 自动删除
+    const deleteTime = moment().add(5, 'minutes').format('YYYY-MM-DD HH:mm:ss');
+    for (const mid of sentMsgIds) {
+        await query('INSERT INTO auto_delete (chat_id, message_id, delete_at) VALUES ($1, $2, $3)', [ctx.chat.id, mid, deleteTime]);
+    }
+    await ctx.reply('⏳ 消息将在 5 分钟后自动销毁。');
+};
+
+const startFirstVerify = async (ctx) => {
+    await query("UPDATE users SET state = 'WAIT_Y_PHOTO' WHERE chat_id = $1", [ctx.user.chat_id]);
+    const text = `<b>🔰 首次验证 (无套路 3秒自动审核)</b>\n\n` +
+                 `教程：打开支付宝扫一扫，点击完成助力。\n` +
+                 `<b>请上传截图</b>：截图需包含“你截图的时间”和“助力成功”文字。\n\n` +
+                 `👇 请查看下方示例图片，并上传你的截图：`;
+    const media = CONFIG.y_images.map(id => ({ type: 'photo', media: id }));
+    if (media.length > 0) try { await ctx.replyWithMediaGroup(media); } catch(e) {}
+    await ctx.replyWithHTML(text);
+    if (ctx.callbackQuery) await ctx.answerCbQuery();
+};
+
+const startSecondVerify = async (ctx) => {
+    await query("UPDATE users SET state = 'WAIT_YZ_PHOTO' WHERE chat_id = $1", [ctx.user.chat_id]);
+    const text = `<b>🛡 二次验证 (防作弊系统)</b>\n\n` +
+                 `这是本活动<b>最后一次验证</b>！通过后永久免费，无限制浏览！\n` +
+                 `教程：打开支付宝扫二维码 -> 点击 <b>“去凑分”</b> -> 页面截图。\n` +
+                 `<b>截图要求</b>：需要出现 <b>芝麻分数字</b>。\n\n` +
+                 `👇 请参照下方 3 张示例图上传：`;
+    const media = CONFIG.yz_images.map(id => ({ type: 'photo', media: id }));
+    if (media.length > 0) try { await ctx.replyWithMediaGroup(media); } catch(e) {}
+    await ctx.replyWithHTML(text);
+    if (ctx.callbackQuery) await ctx.answerCbQuery();
+};
+
+// ==========================================
+// 7. 消息处理 (VIP验证 / 图片 / Admin)
+// ==========================================
+
+bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
+    const user = ctx.user;
+    const cid = ctx.from.id;
+    const text = ctx.message.text;
+
+    // --- 优先：管理员获取 File ID ---
+    if (cid === ADMIN_ID && user.admin_state === 'GET_FILE_ID') {
+        if (text && text.startsWith('/')) return next();
+        let fileId = '未识别';
+        if (ctx.message.photo) fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+        else if (ctx.message.document) fileId = ctx.message.document.file_id;
+        else if (ctx.message.video) fileId = ctx.message.video.file_id;
+        await ctx.replyWithHTML(`File ID:\n<code>${fileId}</code>`, Markup.inlineKeyboard([[Markup.button.callback('🔙 返回后台', 'back_to_admin')]]));
+        return;
+    }
+
+    // --- 管理员上传内容 ---
+    if (cid === ADMIN_ID && user.admin_state === 'WAIT_CONTENT') {
+        if (text && text.startsWith('/')) return next();
+        return handleAdminUpload(ctx);
+    }
+
+    // --- 核心：VIP 订单号验证 (无限重试) ---
+    if (user.state === 'WAIT_PAYMENT_ORDER' && text) {
+        // 验证：以 20260 开头
+        if (text.trim().startsWith('20260')) {
+            // 成功：设为VIP，解封，设为 IDLE
+            await query(`UPDATE users SET is_vip = TRUE, is_banned = FALSE, state = 'IDLE' WHERE chat_id = $1`, [cid]);
+            
+            await ctx.replyWithHTML(
+                `🎉 <b>验证通过！</b>\n\n您已成为尊贵的 VIP 会员，享有所有特权。`,
+                Markup.inlineKeyboard([
+                    [Markup.button.url('🔗 点击加入会员群', CONFIG.vip_group_link)]
+                ])
+            );
+
+            // 给管理员发待处理通知
+            const timeStr = moment().tz('Asia/Shanghai').format('YYYY.MM.DD HH:mm:ss');
+            const caption = `<b>💰 VIP订单审核 (待处理)</b>\n\n` +
+                            `用户：${user.first_name || '未设置'} (ID: <code>${cid}</code>)\n` +
+                            `订单号：<code>${text}</code>\n` +
+                            `时间：${timeStr}\n` +
+                            `状态：系统已通过，请人工复核`;
+            
+            try {
+                await bot.telegram.sendMessage(ADMIN_ID, caption, {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [Markup.button.callback('✅ 确认 (无事发生)', `audit_pass_${cid}`)],
+                            [Markup.button.callback('↩️ 驳回 (取消VIP)', `audit_reject_vip_${cid}`)],
+                            [Markup.button.callback('🚫 封禁 (永久)', `audit_ban_${cid}`)]
+                        ]
+                    }
+                });
+            } catch(e) {}
+            return;
+
+        } else {
+            // 失败：无限重试
+            await ctx.reply('❌ 验证失败，未查询到订单信息。\n请核对后重新输入：');
+            return;
+        }
+    }
+
+    // --- 验证图片上传 (/y, /yz) ---
+    // 关键点：管理员如果是测试状态(使用/cz后)，这里也会执行，并发送工单给管理员自己
+    if (user.state === 'WAIT_Y_PHOTO' || user.state === 'WAIT_YZ_PHOTO') {
+        if (!ctx.message.photo && !ctx.message.document) {
+            if (text && text.startsWith('/')) return next();
+            return ctx.reply('❌ 格式错误，请上传图片截图！');
+        }
+
+        const isSecond = user.state === 'WAIT_YZ_PHOTO';
+        const photo = ctx.message.photo ? ctx.message.photo[ctx.message.photo.length - 1] : ctx.message.document;
+        const fileId = photo.file_id;
+
+        await ctx.reply('✅ 验证成功！系统正在后台二次核验...');
+
+        // 更新状态：直接过前端
+        if (isSecond) {
+            await query("UPDATE users SET second_verify_done = $1, state = 'IDLE' WHERE chat_id = $2", [true, cid]);
+        } else {
+            const nowTime = moment().tz('Asia/Shanghai').format('YYYY-MM-DD HH:mm:ss');
+            await query("UPDATE users SET first_verify_status = $1, first_verify_time = $2, state = 'IDLE' WHERE chat_id = $3", [true, nowTime, cid]);
+        }
+
+        await sendDhPage(ctx, 1);
+
+        // 发送工单给管理员 (即使是管理员自己也会收到)
+        const verifyTypeStr = isSecond ? '(二次验证)' : '(首次验证)';
+        const timeStr = moment().tz('Asia/Shanghai').format('YYYY.MM.DD HH:mm:ss');
+        const caption = `<b>📝 待处理工单 ${verifyTypeStr}</b>\n\n` +
+                        `用户：${user.first_name} (ID: <code>${cid}</code>)\n` +
+                        `时间：${timeStr}\n` +
+                        `状态：自动放行，等待复核`;
+
+        await bot.telegram.sendPhoto(ADMIN_ID, fileId, {
+            caption: caption,
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [Markup.button.callback('✅ 通过 (无事发生)', `audit_pass_${cid}`)],
+                    [Markup.button.callback('↩️ 驳回 (重置)', `audit_reject_${cid}_${isSecond ? '2' : '1'}`)],
+                    [Markup.button.callback('🚫 封禁 (永久)', `audit_ban_${cid}`)]
+                ]
+            }
+        });
+        return;
+    }
+
+    next();
+});
+
+// ==========================================
+// 8. 管理员功能
+// ==========================================
+
+bot.command('admin', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET admin_state = 'IDLE', editing_keyword = '' WHERE chat_id = $1", [ADMIN_ID]);
+    await ctx.reply('👮‍♂️ <b>管理员后台</b>', {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [Markup.button.callback('📂 获取 File ID', 'admin_get_fileid')],
+                [Markup.button.callback('📤 频道转发库 (上架)', 'admin_add_product')],
+                [Markup.button.callback('🚫 退出后台', 'noop')]
+            ]
+        }
+    });
+});
+
+bot.action('admin_get_fileid', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET admin_state = 'GET_FILE_ID' WHERE chat_id = $1", [ADMIN_ID]);
+    await ctx.editMessageText('请发送图片/视频/文件，我将返回 file_id。\n\n⚠️ <b>任意格式均可。</b>', 
+        Markup.inlineKeyboard([[Markup.button.callback('🔙 返回后台', 'back_to_admin')]])
+    );
+    await ctx.answerCbQuery();
+});
+
+bot.action('back_to_admin', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET admin_state = 'IDLE' WHERE chat_id = $1", [ADMIN_ID]);
+    await ctx.editMessageText('👮‍♂️ <b>管理员后台</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[Markup.button.callback('📂 获取 File ID', 'admin_get_fileid')], [Markup.button.callback('📤 频道转发库 (上架)', 'admin_add_product')]] } });
+    await ctx.answerCbQuery();
+});
+
+// /c 广播
+bot.command('c', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    const content = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!content) return ctx.reply('用法：/c 内容');
+    const res = await query('SELECT chat_id FROM users WHERE is_banned = FALSE');
+    await ctx.reply(`正在广播给 ${res.rows.length} 人...`);
+    for (const u of res.rows) { try { await bot.telegram.sendMessage(u.chat_id, content); } catch(e) {} }
+    await ctx.reply(`✅ 广播完成。`);
+});
+
+// /q 免验证
+bot.command('q', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET is_vip = TRUE, state = 'IDLE' WHERE chat_id = $1", [ADMIN_ID]);
+    await ctx.reply('✅ 已开启 VIP 免验证模式。');
+});
+
+// /cz 重置 (管理员测试专用)
+bot.command('cz', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    // 重置所有状态，包括 is_vip，并清空历史
+    await query(`UPDATE users SET 
+        first_verify_status = FALSE, 
+        second_verify_done = FALSE, 
+        is_vip = FALSE, 
+        download_count = 0, 
+        state = 'IDLE', 
+        reject_count = 0 
+        WHERE chat_id = $1`, [ADMIN_ID]);
+    await ctx.reply('🔄 您的前台状态已完全重置。\n现在您可以像新用户一样测试 /y 和 /yz 流程 (工单会发给自己)。');
+});
+
+// 商品上架
+bot.action('admin_add_product', async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET admin_state = 'WAIT_KEYWORD' WHERE chat_id = $1", [ADMIN_ID]);
+    await ctx.reply('请发送 <b>关键词</b> (如 001)：', { parse_mode: 'HTML' });
+    await ctx.answerCbQuery();
+});
+
+bot.on('text', async (ctx, next) => {
+    const user = ctx.user;
+    if (ctx.from.id === ADMIN_ID && user.admin_state === 'WAIT_KEYWORD') {
+        const keyword = ctx.message.text;
+        await query("UPDATE users SET editing_keyword = $1, admin_state = 'WAIT_CONTENT' WHERE chat_id = $2", [keyword, ADMIN_ID]);
+        await ctx.reply(`关键词：<b>${keyword}</b>\n请发送内容，完成后 /admin_finish_upload`, { parse_mode: 'HTML' });
+        return;
+    }
+    if (ctx.message.text === '/admin_finish_upload' && ctx.from.id === ADMIN_ID) {
+        await query("UPDATE users SET admin_state = 'IDLE', editing_keyword = '' WHERE chat_id = $1", [ADMIN_ID]);
+        await ctx.reply('✅ 录入完成。');
+        return;
+    }
+    next();
+});
+
+const handleAdminUpload = async (ctx) => {
+    const user = ctx.user;
+    const keyword = user.editing_keyword;
+    let contentItem = {};
+    if (ctx.message.text) contentItem = { type: 'text', text: ctx.message.text };
+    else if (ctx.message.photo) contentItem = { type: 'photo', fileId: ctx.message.photo[ctx.message.photo.length - 1].file_id };
+    else if (ctx.message.video) contentItem = { type: 'video', fileId: ctx.message.video.file_id };
+    else if (ctx.message.document) contentItem = { type: 'document', fileId: ctx.message.document.file_id };
+
+    const res = await query('SELECT content FROM products WHERE keyword = $1', [keyword]);
+    let currentContent = res.rows.length > 0 ? res.rows[0].content : [];
+    currentContent.push(contentItem);
+    await query(`INSERT INTO products (keyword, content) VALUES ($1, $2) ON CONFLICT (keyword) DO UPDATE SET content = $2`, [keyword, JSON.stringify(currentContent)]);
+    await ctx.reply('✅ 已接收 1 条。');
+};
+
+// ==========================================
+// 9. 审核回调处理 (含VIP复核)
+// ==========================================
+
+bot.action(/audit_pass_(\d+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await ctx.editMessageCaption(`✅ 已通过 (ID: ${ctx.match[1]})`);
+    await ctx.answerCbQuery();
+});
+
+// 普通验证驳回
+bot.action(/audit_reject_(\d+)_(\d)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    const targetId = ctx.match[1];
+    const type = ctx.match[2]; 
+    await query("UPDATE users SET reject_count = reject_count + 1 WHERE chat_id = $1", [targetId]);
+    if (type === '1') await query("UPDATE users SET first_verify_status = FALSE WHERE chat_id = $1", [targetId]);
+    if (type === '2') await query("UPDATE users SET second_verify_done = FALSE WHERE chat_id = $1", [targetId]);
+    try { await bot.telegram.sendMessage(targetId, `❌ 您的验证被驳回，请重新上传。`); } catch(e) {}
+    await ctx.editMessageCaption(`↩️ 已驳回 (ID: ${targetId})`);
+    await ctx.answerCbQuery();
+});
+
+// VIP 驳回 (取消VIP)
+bot.action(/audit_reject_vip_(\d+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    const targetId = ctx.match[1];
+    await query("UPDATE users SET is_vip = FALSE WHERE chat_id = $1", [targetId]);
+    try { await bot.telegram.sendMessage(targetId, `❌ 您的订单审核未通过，VIP 权限已撤销。`); } catch(e) {}
+    await ctx.editMessageCaption(`↩️ 已驳回VIP (ID: ${targetId})`);
+    await ctx.answerCbQuery();
+});
+
+// 封禁
+bot.action(/audit_ban_(\d+)/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await query("UPDATE users SET is_banned = TRUE WHERE chat_id = $1", [ctx.match[1]]);
+    try { await bot.telegram.sendMessage(ctx.match[1], '🚫 已被永久封禁。'); } catch(e) {}
+    await ctx.editMessageCaption(`🚫 已封禁 (ID: ${ctx.match[1]})`);
+    await ctx.answerCbQuery();
+});
+
+// ==========================================
+// 10. Vercel Serverless
+// ==========================================
+module.exports = async (req, res) => {
+    if (req.query.cron) {
+        const now = moment().tz('Asia/Shanghai').format('YYYY-MM-DD HH:mm:ss');
+        const tasks = await query('SELECT * FROM auto_delete WHERE delete_at <= $1', [now]);
+        for (const task of tasks.rows) { try { await bot.telegram.deleteMessage(task.chat_id, task.message_id); } catch(e) {} }
+        if (tasks.rows.length > 0) { const ids = tasks.rows.map(t => t.id).join(','); await query(`DELETE FROM auto_delete WHERE id IN (${ids})`); }
+        return res.status(200).send('Cron Done');
+    }
+    try {
+        if (req.method === 'POST') await bot.handleUpdate(req.body);
+        res.status(200).send('OK');
+    } catch (e) { console.error(e); res.status(500).send('Error'); }
+};
