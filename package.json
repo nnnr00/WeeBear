@@ -1,16 +1,13 @@
 {
-  "name": "telegram-bot-vercel",
-  "version": "1.0.0",
-  "description": "Telegram Bot on Vercel with Neon DB",
-  "main": "api/index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "dependencies": {
-    "grammy": "^1.19.2",
-    "pg": "^8.11.3"
-  },
-  "engines": {
-    "node": "20.x"
+  "crons": [
+    {
+      "path": "/api/index?cron=true",
+      "schedule": "* * * * *"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    }
   }
 }
