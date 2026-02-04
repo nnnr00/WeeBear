@@ -9,6 +9,6 @@
     "moment-timezone": "^0.5.45"
   },
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
