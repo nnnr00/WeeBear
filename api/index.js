@@ -193,7 +193,6 @@ function createPaginationKeyboard(currentPage, totalCount, prefix, itemsPerPage 
     
     return buttons;
 }
-const { Bot, webhookCallback, InlineKeyboard } = require("grammy");
 const { Pool } = require("pg");
 
 // ==================== 基础配置 ====================
