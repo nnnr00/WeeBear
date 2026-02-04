@@ -193,7 +193,6 @@ function createPaginationKeyboard(currentPage, totalCount, prefix, itemsPerPage 
     
     return buttons;
 }
-const { Pool } = require("pg");
 
 // ==================== 基础配置 ====================
 const pool = new Pool({
