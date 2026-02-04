@@ -19,9 +19,9 @@ const query = async (text, params) => await pool.query(text, params);
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 
-// 🔴 🔴 🔴 强制修复配置：全部留空 🔴 🔴 🔴
-// 之前死机是因为这里填了假 ID。现在强制为空，机器人只发文字，保证流畅。
-// 等你部署好，能用了，再去后台获取真实 ID 填进去。
+// 🔴 🔴 🔴 重点：防止死机配置 🔴 🔴 🔴
+// 默认数组必须为空 []，否则点击确认会死机。
+// 只有当你去后台获取了真实 ID 后，才能填入。
 const CONFIG = {
     y_images: [], 
     yz_images: [],
@@ -31,7 +31,30 @@ const CONFIG = {
 };
 
 // ==========================================
-// 3. 全局中间件
+// 3. 辅助函数：显示管理员面板
+// ==========================================
+// 提取出来以便在录入完成后调用
+const showAdminPanel = async (ctx) => {
+    const text = '👮‍♂️ <b>管理员后台</b>';
+    const keyboard = {
+        inline_keyboard: [
+            [Markup.button.callback('📂 获取 File ID', 'admin_get_fileid')],
+            [Markup.button.callback('📤 频道转发库 (上架)', 'admin_add_product')],
+            [Markup.button.callback('⏳ 待处理工单', 'admin_pending_info')],
+            [Markup.button.callback('🚫 退出后台', 'noop')]
+        ]
+    };
+
+    // 如果是回调（点击按钮），用 editMessage；如果是命令，用 reply
+    if (ctx.callbackQuery) {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    } else {
+        await ctx.replyWithHTML(text, { reply_markup: keyboard });
+    }
+};
+
+// ==========================================
+// 4. 全局中间件
 // ==========================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
@@ -52,7 +75,7 @@ bot.use(async (ctx, next) => {
         user = res.rows[0];
     }
 
-    // 每日重置 (VIP 不再免验证，所以所有人每天都要重置)
+    // 每日重置 (所有人每天都要重置首次验证)
     if (user.last_verify_date !== today) {
         await query(
             `UPDATE users SET first_verify_status = $1, last_verify_date = $2, download_count = 0 WHERE chat_id = $3`,
@@ -84,10 +107,11 @@ bot.use(async (ctx, next) => {
 });
 
 // ==========================================
-// 4. 基础命令 (/start, /dh)
+// 5. 基础命令 (/start, /dh)
 // ==========================================
 
 bot.start(async (ctx) => {
+    // 重置状态
     await query("UPDATE users SET state = 'IDLE' WHERE chat_id = $1", [ctx.user.chat_id]);
 
     const args = ctx.message.text.split(' ');
@@ -110,12 +134,13 @@ const sendDhPage = async (ctx, page = 1) => {
     const limit = 10;
     const offset = (page - 1) * limit;
     
-    // 修复：如果没有商品，提示用户，而不是没反应
+    // 查询商品
     const pRes = await query('SELECT keyword FROM products ORDER BY keyword LIMIT $1 OFFSET $2', [limit, offset]);
     const products = pRes.rows;
     
+    // 无商品提示
     if (products.length === 0 && page === 1) {
-        return ctx.reply('📭 暂无上架商品。管理员请使用 /admin 上架。');
+        return ctx.reply('📭 暂无上架商品。请管理员使用 /admin 上架。');
     }
 
     const cRes = await query('SELECT COUNT(*) FROM products');
@@ -139,7 +164,7 @@ const sendDhPage = async (ctx, page = 1) => {
     if (page < totalPages) navRow.push(Markup.button.callback('下一页 ➡️', `dh_page_${page + 1}`));
     buttons.push(navRow);
 
-    // 底部按钮：根据验证状态变化
+    // 底部按钮
     let verifyBtnText = '🛡 开始验证';
     let verifyAction = 'goto_verify_y';
     
@@ -176,7 +201,7 @@ bot.action('goto_dh', async (ctx) => {
 });
 
 // ==========================================
-// 5. VIP 付费逻辑 (/v)
+// 6. VIP 逻辑 (/v)
 // ==========================================
 
 bot.command('v', async (ctx) => showVipPage(ctx));
@@ -227,7 +252,7 @@ bot.action('btn_paid_verify', async (ctx) => {
 });
 
 // ==========================================
-// 6. 验证漏斗 (核心逻辑修正)
+// 7. 验证漏斗 (解决死机问题)
 // ==========================================
 
 bot.action(/prod_(.+)/, async (ctx) => {
@@ -240,12 +265,11 @@ bot.action(/prod_(.+)/, async (ctx) => {
 });
 
 bot.action(/confirm_prod_(.+)/, async (ctx) => {
+    // ⚡️⚡️ 立即响应，防止转圈死机 ⚡️⚡️
+    await ctx.answerCbQuery();
+
     const keyword = ctx.match[1];
     const user = ctx.user;
-
-    // 逻辑修正：VIP 不再免验证。所有人必须走验证。
-    // 如果想要 VIP 免验证，请取消下面这行的注释
-    // if (user.is_vip) return sendProduct(ctx, keyword);
 
     // 1. 首次验证
     if (!user.first_verify_status) return startFirstVerify(ctx);
@@ -261,10 +285,11 @@ bot.action(/confirm_prod_(.+)/, async (ctx) => {
         }
     }
 
+    // 3. 发送资源
     return sendProduct(ctx, keyword);
 });
 
-// 发送资源
+// 发送资源逻辑
 const sendProduct = async (ctx, keyword) => {
     const res = await query('SELECT content FROM products WHERE keyword = $1', [keyword]);
     if (res.rows.length === 0) return ctx.reply('⚠️ 资源不存在或已下架。');
@@ -307,15 +332,16 @@ const startFirstVerify = async (ctx) => {
                  `<b>请上传截图</b>：截图需包含“你截图的时间”和“助力成功”文字。\n\n` +
                  `👇 请查看下方示例图片，并上传你的截图：`;
     
-    // 修复：如果没图，只发文字，防止死机
+    // ⚡️⚡️ 修复死机：如果有图才发，没图只发字 ⚡️⚡️
     if (CONFIG.y_images.length > 0) {
         const media = CONFIG.y_images.map(id => ({ type: 'photo', media: id }));
-        await ctx.replyWithMediaGroup(media).catch(() => ctx.replyWithHTML(text));
+        await ctx.replyWithMediaGroup(media).catch((e) => {
+            console.error("发图失败，降级文字", e);
+            ctx.replyWithHTML(text);
+        });
     } else {
         await ctx.replyWithHTML(text);
     }
-    
-    if (ctx.callbackQuery) await ctx.answerCbQuery();
 };
 
 const startSecondVerify = async (ctx) => {
@@ -332,12 +358,10 @@ const startSecondVerify = async (ctx) => {
     } else {
         await ctx.replyWithHTML(text);
     }
-
-    if (ctx.callbackQuery) await ctx.answerCbQuery();
 };
 
 // ==========================================
-// 7. 消息处理
+// 8. 消息处理 (VIP / 图片 / Admin录入)
 // ==========================================
 
 bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
@@ -345,7 +369,7 @@ bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
     const cid = ctx.from.id;
     const text = ctx.message.text;
 
-    // Admin Get ID
+    // --- Admin: Get ID ---
     if (cid === ADMIN_ID && user.admin_state === 'GET_FILE_ID') {
         if (text && text.startsWith('/')) return next();
         let fileId = '未识别';
@@ -356,13 +380,13 @@ bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
         return;
     }
 
-    // Admin Upload
+    // --- Admin: Upload Content ---
     if (cid === ADMIN_ID && user.admin_state === 'WAIT_CONTENT') {
         if (text && text.startsWith('/')) return next();
         return handleAdminUpload(ctx);
     }
 
-    // VIP Order (只是记录VIP身份，不影响验证流程)
+    // --- VIP Order ---
     if (user.state === 'WAIT_PAYMENT_ORDER' && text) {
         if (text.trim().startsWith('20260')) {
             await query(`UPDATE users SET is_vip = TRUE, is_banned = FALSE, state = 'IDLE' WHERE chat_id = $1`, [cid]);
@@ -385,7 +409,7 @@ bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
         }
     }
 
-    // 图片验证 (/y, /yz)
+    // --- Verify Photo ---
     if (user.state === 'WAIT_Y_PHOTO' || user.state === 'WAIT_YZ_PHOTO') {
         if (!ctx.message.photo && !ctx.message.document) {
             if (text && text.startsWith('/')) return next();
@@ -408,7 +432,6 @@ bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
         const verifyTypeStr = isSecond ? '(二次验证)' : '(首次验证)';
         const caption = `<b>📝 待处理工单 ${verifyTypeStr}</b>\n\n用户：${user.first_name} (ID: <code>${cid}</code>)\n状态：自动放行`;
         
-        // 发送给管理员 (即使是管理员自己上传的，也会发，方便测试 /cz)
         await bot.telegram.sendPhoto(ADMIN_ID, fileId, {
             caption: caption,
             parse_mode: 'HTML',
@@ -422,25 +445,16 @@ bot.on(['text', 'photo', 'document', 'video'], async (ctx, next) => {
 });
 
 // ==========================================
-// 8. Admin 后台
+// 9. Admin 后台逻辑
 // ==========================================
 
 bot.command('admin', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     await query("UPDATE users SET admin_state = 'IDLE', editing_keyword = '' WHERE chat_id = $1", [ADMIN_ID]);
-    await ctx.reply('👮‍♂️ <b>管理员后台</b>', {
-        parse_mode: 'HTML',
-        reply_markup: {
-            inline_keyboard: [
-                [Markup.button.callback('📂 获取 File ID', 'admin_get_fileid')],
-                [Markup.button.callback('📤 频道转发库', 'admin_add_product')],
-                [Markup.button.callback('⏳ 待处理工单', 'admin_pending_info')],
-                [Markup.button.callback('🚫 退出后台', 'noop')]
-            ]
-        }
-    });
+    await showAdminPanel(ctx);
 });
 
+// 待处理工单提示
 bot.action('admin_pending_info', async (ctx) => {
     const res = await query(`SELECT COUNT(*) FROM users WHERE state IN ('WAIT_Y_PHOTO', 'WAIT_YZ_PHOTO')`);
     await ctx.editMessageText(`<b>⏳ 待处理工单</b>\n\n当前上传中：${res.rows[0].count} 人\n工单会推送至此窗口。`, { 
@@ -459,7 +473,7 @@ bot.action('admin_get_fileid', async (ctx) => {
 bot.action('back_to_admin', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     await query("UPDATE users SET admin_state = 'IDLE' WHERE chat_id = $1", [ADMIN_ID]);
-    await ctx.editMessageText('👮‍♂️ <b>管理员后台</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[Markup.button.callback('📂 获取 File ID', 'admin_get_fileid')], [Markup.button.callback('📤 频道转发库', 'admin_add_product')], [Markup.button.callback('⏳ 待处理工单', 'admin_pending_info')], [Markup.button.callback('🚫 退出后台', 'noop')]] } });
+    await showAdminPanel(ctx);
     await ctx.answerCbQuery();
 });
 
@@ -467,27 +481,28 @@ bot.action('back_to_admin', async (ctx) => {
 bot.command('c', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     const content = ctx.message.text.split(' ').slice(1).join(' ');
-    if (!content) return ctx.reply('用法：/c 内容');
+    if (!content) return ctx.reply('用法：/c 广播内容');
     const res = await query('SELECT chat_id FROM users WHERE is_banned = FALSE');
     await ctx.reply(`广播给 ${res.rows.length} 人...`);
     for (const u of res.rows) { try { await bot.telegram.sendMessage(u.chat_id, content); } catch(e) {} }
     await ctx.reply(`✅ 广播完成。`);
 });
 
-// /q 强制取消验证状态 (不通过，只是取消卡死)
+// /q 强制取消验证状态 (解决卡死状态)
 bot.command('q', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     await query("UPDATE users SET state = 'IDLE' WHERE chat_id = $1", [ADMIN_ID]);
-    await ctx.reply('✅ 已强制取消您的“等待上传”状态，重置为 IDLE。');
+    await ctx.reply('✅ 已强制重置状态为 IDLE (退出卡死)。\n您仍需通过验证。');
 });
 
-// /cz 重置测试 (管理员)
+// /cz 重置测试
 bot.command('cz', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     await query(`UPDATE users SET first_verify_status = FALSE, second_verify_done = FALSE, is_vip = FALSE, download_count = 0, state = 'IDLE', reject_count = 0 WHERE chat_id = $1`, [ADMIN_ID]);
-    await ctx.reply('🔄 状态已重置。请开始测试 /dh -> /y。');
+    await ctx.reply('🔄 测试状态已重置。\n请像新用户一样测试 /dh -> /y。');
 });
 
+// 上架流程
 bot.action('admin_add_product', async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return;
     await query("UPDATE users SET admin_state = 'WAIT_KEYWORD' WHERE chat_id = $1", [ADMIN_ID]);
@@ -497,15 +512,18 @@ bot.action('admin_add_product', async (ctx) => {
 
 bot.on('text', async (ctx, next) => {
     const user = ctx.user;
+    // 上架：输入关键词
     if (ctx.from.id === ADMIN_ID && user.admin_state === 'WAIT_KEYWORD') {
         const keyword = ctx.message.text;
         await query("UPDATE users SET editing_keyword = $1, admin_state = 'WAIT_CONTENT' WHERE chat_id = $2", [keyword, ADMIN_ID]);
         await ctx.reply(`关键词：<b>${keyword}</b>\n请发送内容，完后 /admin_finish_upload`, { parse_mode: 'HTML' });
         return;
     }
+    // 上架：完成录入 -> 自动跳回 Admin 面板
     if (ctx.message.text === '/admin_finish_upload' && ctx.from.id === ADMIN_ID) {
         await query("UPDATE users SET admin_state = 'IDLE', editing_keyword = '' WHERE chat_id = $1", [ADMIN_ID]);
-        await ctx.reply('✅ 录入完成。');
+        await ctx.reply('✅ 商品录入完成。');
+        await showAdminPanel(ctx); // 自动跳回后台
         return;
     }
     next();
@@ -527,6 +545,9 @@ const handleAdminUpload = async (ctx) => {
     await ctx.reply('✅ 已接收 1 条。');
 };
 
+// ==========================================
+// 10. 审核回调
+// ==========================================
 bot.action(/audit_pass_(\d+)/, async (ctx) => { if (ctx.from.id !== ADMIN_ID) return; await ctx.editMessageCaption(`✅ 已通过`); await ctx.answerCbQuery(); });
 bot.action(/audit_reject_(\d+)_(\d)/, async (ctx) => { 
     if (ctx.from.id !== ADMIN_ID) return; 
@@ -547,6 +568,9 @@ bot.action(/audit_ban_(\d+)/, async (ctx) => {
     await ctx.editMessageCaption(`🚫 已封禁`); await ctx.answerCbQuery();
 });
 
+// ==========================================
+// 11. Vercel Serverless 入口
+// ==========================================
 module.exports = async (req, res) => {
     if (req.query.cron) {
         const now = moment().tz('Asia/Shanghai').format('YYYY-MM-DD HH:mm:ss');
