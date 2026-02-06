@@ -1,7 +1,7 @@
 const { Bot, InlineKeyboard, webhookCallback, GrammyError, HttpError, InputMediaBuilder } = require("grammy");
 const { Pool } = require("pg");
 
-/* -------------------- 你提供的 file_id（原数据，保留） -------------------- */
+/* -------------------- 你提供的 file_id（原数据） -------------------- */
 
 const FILE_ID_PAYMENT = "AgACAgUAAxkBAAIDd2mEHCq1fvS4dwIjba1YCTLObQonAAJtDWsbrPMhVNjJFj6MFYBoAQADAgADeQADOAQ";
 const FILE_ID_ORDER = "AgACAgUAAxkBAAIDgGmEHH9bpq3a64REkLP7QoHNoQjWAAJyDWsbrPMhVMEDi7UYH-23AQADAgADeQADOAQ";
@@ -38,21 +38,11 @@ const pool = new Pool({
 
 const bot = new Bot(process.env.BOT_TOKEN);
 
-/* -------------------- 时间工具（北京时间） -------------------- */
+/* -------------------- 工具：时间（北京时间） -------------------- */
 
 function getBeijingNowDate() {
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
-
-function formatBeijingDateTime(date) {
-  const d = date;
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  const hour = String(d.getUTCHours()).padStart(2, "0");
-  const minute = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${year}.${month}.${day} 北京时间 ${hour}:${minute}`;
 }
 
 function formatBeijingDateOnly(date) {
@@ -63,13 +53,15 @@ function formatBeijingDateOnly(date) {
   return `${year}-${month}-${day}`;
 }
 
-/* -------------------- 管理员判定 -------------------- */
-
 function isAdminUserId(userId) {
   return ADMIN_IDS.includes(Number(userId));
 }
 
-/* -------------------- users：确保存在 -------------------- */
+function sleepMilliseconds(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/* -------------------- 数据库：users -------------------- */
 
 async function ensureUserExists(telegramId, username, firstName) {
   const client = await pool.connect();
@@ -123,7 +115,7 @@ async function updateUserFields(telegramId, fieldsObject) {
   }
 }
 
-/* -------------------- user_states：状态机 -------------------- */
+/* -------------------- 数据库：user_states（用于流程状态 + 延迟删除记录） -------------------- */
 
 async function getUserStateRow(userId) {
   const client = await pool.connect();
@@ -174,13 +166,7 @@ async function clearUserState(userId) {
   }
 }
 
-/* -------------------- /c：只取消管理员自己的流程状态 -------------------- */
-
-async function cancelAdminCurrentFlow(adminId) {
-  await clearUserState(adminId);
-}
-
-/* -------------------- 当日 /y 是否有效（北京时间） -------------------- */
+/* -------------------- 当日 /y 是否有效 -------------------- */
 
 async function isDailyFirstVerifyValid(userRow) {
   if (!userRow) return false;
@@ -193,7 +179,7 @@ async function isDailyFirstVerifyValid(userRow) {
   return storedDate === today;
 }
 
-/* -------------------- 商品：分页读取 / 获取 / 删除 / 上架 -------------------- */
+/* -------------------- products：分页读取 / 获取 -------------------- */
 
 async function getProductsPage(pageNumber, pageSize) {
   const offset = (pageNumber - 1) * pageSize;
@@ -204,7 +190,7 @@ async function getProductsPage(pageNumber, pageSize) {
 
     const listResult = await client.query(
       `
-      SELECT id, keyword, content_type, content_data, created_at
+      SELECT id, keyword, content_type, content_data
       FROM products
       ORDER BY keyword ASC
       LIMIT $1 OFFSET $2
@@ -223,104 +209,13 @@ async function getProductByKeyword(keyword) {
   try {
     const result = await client.query(
       `
-      SELECT id, keyword, content_type, content_data, created_at
+      SELECT id, keyword, content_type, content_data
       FROM products
       WHERE keyword = $1
       `,
       [keyword]
     );
     return result.rows[0] || null;
-  } finally {
-    client.release();
-  }
-}
-
-async function deleteProductByKeyword(keyword) {
-  const client = await pool.connect();
-  try {
-    await client.query(`DELETE FROM products WHERE keyword = $1`, [keyword]);
-  } finally {
-    client.release();
-  }
-}
-
-async function upsertProduct(keyword, contentType, contentDataText) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `
-      INSERT INTO products (keyword, content_type, content_data)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (keyword) DO UPDATE SET
-        content_type = EXCLUDED.content_type,
-        content_data = EXCLUDED.content_data
-      `,
-      [keyword, contentType, contentDataText]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-/* -------------------- 工单：pending_reviews -------------------- */
-
-async function createPendingReview({ userId, username, firstName, reviewType, fileId, orderNumber, messageId }) {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      `
-      INSERT INTO pending_reviews (user_id, username, first_name, review_type, file_id, order_number, status, message_id)
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-      RETURNING id
-      `,
-      [userId, username || null, firstName || null, reviewType, fileId || null, orderNumber || null, messageId || null]
-    );
-    return result.rows[0].id;
-  } finally {
-    client.release();
-  }
-}
-
-async function updatePendingReviewStatus(pendingId, status) {
-  const client = await pool.connect();
-  try {
-    await client.query(`UPDATE pending_reviews SET status = $1 WHERE id = $2`, [status, pendingId]);
-  } finally {
-    client.release();
-  }
-}
-
-async function deletePendingReview(pendingId) {
-  const client = await pool.connect();
-  try {
-    await client.query(`DELETE FROM pending_reviews WHERE id = $1`, [pendingId]);
-  } finally {
-    client.release();
-  }
-}
-
-async function getPendingReviewsByType(reviewType, pageNumber, pageSize) {
-  const offset = (pageNumber - 1) * pageSize;
-  const client = await pool.connect();
-  try {
-    const countResult = await client.query(
-      `SELECT COUNT(*)::int AS count FROM pending_reviews WHERE status = 'pending' AND review_type = $1`,
-      [reviewType]
-    );
-    const totalCount = countResult.rows[0] ? countResult.rows[0].count : 0;
-
-    const listResult = await client.query(
-      `
-      SELECT id, user_id, username, first_name, review_type, file_id, order_number, submitted_at, status, message_id
-      FROM pending_reviews
-      WHERE status = 'pending' AND review_type = $1
-      ORDER BY submitted_at DESC
-      LIMIT $2 OFFSET $3
-      `,
-      [reviewType, pageSize, offset]
-    );
-
-    return { totalCount, reviews: listResult.rows };
   } finally {
     client.release();
   }
@@ -336,23 +231,11 @@ async function incrementSuccessClaimCount(userId) {
   return next;
 }
 
-/* -------------------- 键盘与文案（带 emoji） -------------------- */
+/* -------------------- 键盘 -------------------- */
 
 function buildStartKeyboard() {
   const keyboard = new InlineKeyboard();
   keyboard.text("🎁 兑换（免费）", "go_dh:1");
-  return keyboard;
-}
-
-function buildAdminKeyboard() {
-  const keyboard = new InlineKeyboard();
-  keyboard.text("🆔 获取 file_id", "admin_get_file_id");
-  keyboard.row();
-  keyboard.text("📦 频道转发库（商品列表）", "admin_products_menu:1");
-  keyboard.row();
-  keyboard.text("🧾 待处理工单", "admin_pending_menu");
-  keyboard.row();
-  keyboard.text("⬅️ 返回", "admin_back");
   return keyboard;
 }
 
@@ -377,18 +260,6 @@ function buildDhKeyboard(products, pageNumber, totalPages, showVipButton) {
   return keyboard;
 }
 
-function buildVipStartKeyboard() {
-  const keyboard = new InlineKeyboard();
-  keyboard.text("✅ 我已付款，开始验证", "vip_paid_start");
-  return keyboard;
-}
-
-function buildJoinGroupKeyboard() {
-  const keyboard = new InlineKeyboard();
-  keyboard.url("🚪 加入会员群", "https://t.me/+495j5rWmApsxYzg9");
-  return keyboard;
-}
-
 function buildGoVerifyKeyboard(type) {
   const keyboard = new InlineKeyboard();
   if (type === "y") {
@@ -401,21 +272,65 @@ function buildGoVerifyKeyboard(type) {
   return keyboard;
 }
 
-function buildReviewActionKeyboard(pendingId, reviewType, reviewOwnerUserId) {
+function buildBackToDhKeyboard() {
   const keyboard = new InlineKeyboard();
-  keyboard.text("✅ 通过", `review_ok:${pendingId}:${reviewType}`);
-  keyboard.text("❌ 驳回", `review_reject:${pendingId}:${reviewType}`);
-  keyboard.row();
-  keyboard.text("⛔ 封禁", `review_ban:${pendingId}:${reviewType}`);
-
-  if (isAdminUserId(reviewOwnerUserId)) {
-    keyboard.text("🗑 删除(测试)", `review_delete:${pendingId}:${reviewType}`);
-  }
-
+  keyboard.text("🎁 返回兑换页", "go_dh:1");
   return keyboard;
 }
 
-/* -------------------- /start 与 start=dh -------------------- */
+/* -------------------- 延迟删除：记录与清理（serverless 兼容） -------------------- */
+
+async function setLastSentMessagesForAutoDelete(userId, chatId, messageIdList, createdAtMillis) {
+  await setUserState(userId, "idle", {
+    auto_delete: {
+      chat_id: chatId,
+      message_ids: messageIdList,
+      created_at_millis: createdAtMillis
+    }
+  });
+}
+
+async function tryAutoDeleteIfExpired(ctx) {
+  const from = ctx.from;
+  if (!from) return;
+
+  const stateRow = await getUserStateRow(from.id);
+  if (!stateRow || !stateRow.temp_data) return;
+
+  let tempData;
+  try {
+    tempData = JSON.parse(stateRow.temp_data);
+  } catch (e) {
+    return;
+  }
+
+  if (!tempData || !tempData.auto_delete) return;
+
+  const autoDelete = tempData.auto_delete;
+  if (!autoDelete.chat_id || !Array.isArray(autoDelete.message_ids) || !autoDelete.created_at_millis) return;
+
+  const nowMillis = Date.now();
+  const expireMillis = Number(autoDelete.created_at_millis) + 5 * 60 * 1000;
+
+  if (nowMillis < expireMillis) {
+    return;
+  }
+
+  const chatId = Number(autoDelete.chat_id);
+  const messageIds = autoDelete.message_ids.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+
+  for (const messageId of messageIds) {
+    try {
+      await bot.api.deleteMessage(chatId, messageId);
+    } catch (e) {
+      /* 删除失败不影响后续 */
+    }
+  }
+
+  await clearUserState(from.id);
+}
+
+/* -------------------- /start 与深层链接 start=dh -------------------- */
 
 bot.command("start", async (ctx) => {
   const from = ctx.from;
@@ -432,17 +347,110 @@ bot.command("start", async (ctx) => {
   const text =
     "🎊 喜迎二月除夕 🎊\n\n" +
     "🆓 全部资源免费观看\n" +
-    "👇 点击【兑换】选择编号即可立即观看\n" +
+    "👇 点击【兑换】选择编号即可观看\n" +
     "✨ 祝你观看愉快～";
 
   await ctx.reply(text, { reply_markup: buildStartKeyboard() });
 });
 
-/* -------------------- /dh 命令入口（必须可用） -------------------- */
+/* -------------------- /dh 命令入口 -------------------- */
 
 bot.command("dh", async (ctx) => {
   await showDhPage(ctx, 1);
 });
+
+/* -------------------- /cz：管理员重置自己前端状态（不重置商品库/后台/数据库数据） -------------------- */
+
+bot.command("cz", async (ctx) => {
+  const from = ctx.from;
+  if (!from) return;
+
+  if (!isAdminUserId(from.id)) {
+    await ctx.reply("❌ 无权限。");
+    return;
+  }
+
+  await ensureUserExists(from.id, from.username, from.first_name);
+
+  await updateUserFields(from.id, {
+    first_verify_passed: false,
+    second_verify_passed: false,
+    first_verify_date: null,
+    first_verify_time: null,
+    click_count: 0,
+    reject_count_first: 0,
+    reject_count_second: 0,
+    needs_manual_review: false
+  });
+
+  await clearUserState(from.id);
+
+  await ctx.reply("✅ 测试重置完成：你当前已恢复为全新前端状态（不影响商品库与后台数据）。");
+});
+
+/* -------------------- /c：只取消管理员自己的流程状态 -------------------- */
+
+bot.command("c", async (ctx) => {
+  const from = ctx.from;
+  if (!from) return;
+
+  if (!isAdminUserId(from.id)) {
+    await ctx.reply("❌ 无权限。");
+    return;
+  }
+
+  await clearUserState(from.id);
+  await ctx.reply("✅ 已取消你当前的后台流程状态。");
+});
+
+/* -------------------- /y 与 /yz（这里只保留入口，具体图片上传逻辑你现有的可继续用） -------------------- */
+
+bot.command("y", async (ctx) => {
+  const from = ctx.from;
+  if (!from) return;
+
+  await ensureUserExists(from.id, from.username, from.first_name);
+
+  const text =
+    "🧩【首次验证】\n\n" +
+    "✅ 上传一张图片即可完成\n" +
+    "📤 请上传图片开始验证：";
+
+  await ctx.replyWithPhoto(FILE_ID_Y_1, { caption: text });
+  await ctx.replyWithPhoto(FILE_ID_Y_2, { caption: "📷 示例图" });
+
+  await setUserState(from.id, "waiting_first_verify_photo", {});
+});
+
+bot.command("yz", async (ctx) => {
+  const from = ctx.from;
+  if (!from) return;
+
+  await ensureUserExists(from.id, from.username, from.first_name);
+
+  const text =
+    "🧩【二次认证】\n\n" +
+    "✅ 通过后将不再出现\n" +
+    "📤 请上传图片开始二次认证：";
+
+  await ctx.replyWithPhoto(FILE_ID_YZ_1, { caption: text });
+  await ctx.replyWithPhoto(FILE_ID_YZ_2, { caption: "📷 示例图" });
+  await ctx.replyWithPhoto(FILE_ID_YZ_3, { caption: "📷 示例图" });
+
+  await setUserState(from.id, "waiting_second_verify_photo", {});
+});
+
+bot.callbackQuery("go_y", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply("请发送 /y 开始首次验证。");
+});
+
+bot.callbackQuery("go_yz", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply("请发送 /yz 开始二次认证。");
+});
+
+/* -------------------- /dh 页面显示 -------------------- */
 
 bot.callbackQuery(/^go_dh:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -454,465 +462,32 @@ async function showDhPage(ctx, pageNumber) {
   if (!from) return;
 
   await ensureUserExists(from.id, from.username, from.first_name);
-  const userRow = await getUserRow(from.id);
 
+  await tryAutoDeleteIfExpired(ctx);
+
+  const userRow = await getUserRow(from.id);
   if (userRow && userRow.is_banned) {
-    await ctx.reply("⛔ 你已被本活动封禁。\n如需继续使用，请加入会员（特价）。", {
-      reply_markup: new InlineKeyboard().text("💎 加入会员（新春特价）", "go_vip")
-    });
+    await ctx.reply("⛔ 你已被本活动封禁。");
     return;
   }
 
   const pageSize = 10;
   const result = await getProductsPage(pageNumber, pageSize);
   const totalPages = Math.max(1, Math.ceil(result.totalCount / pageSize));
+  const dailyVerified = await isDailyFirstVerifyValid(userRow);
 
   const text =
     "🎁 兑换页\n\n" +
     "✅ 点击商品编号即可查看内容\n" +
     "🆓 完全免费，直接观看\n" +
-    "🌟 喜欢就多来看看～";
-
-  const dailyVerified = await isDailyFirstVerifyValid(userRow);
+    "⏳ 内容可能分批发送，请稍等～";
 
   await ctx.reply(text, {
     reply_markup: buildDhKeyboard(result.products, pageNumber, totalPages, dailyVerified)
   });
 }
 
-/* -------------------- /admin -------------------- */
-
-bot.command("admin", async (ctx) => {
-  const from = ctx.from;
-  if (!from) return;
-
-  if (!isAdminUserId(from.id)) {
-    await ctx.reply("❌ 无权限。");
-    return;
-  }
-
-  await ctx.reply("🛠 管理员后台：请选择功能。", { reply_markup: buildAdminKeyboard() });
-});
-
-bot.callbackQuery("admin_back", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  await ctx.reply("🛠 管理员后台：请选择功能。", { reply_markup: buildAdminKeyboard() });
-});
-
-/* -------------------- admin：获取 file_id -------------------- */
-
-bot.callbackQuery("admin_get_file_id", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  await ctx.reply("🆔 请发送图片，我将返回对应的 file_id。");
-  await setUserState(from.id, "admin_waiting_file_id_photo", {});
-});
-
-/* -------------------- admin：商品列表（10个一页 + 点击查看 + 删除确认） -------------------- */
-
-bot.callbackQuery(/^admin_products_menu:(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  await showAdminProductsList(ctx, Number(ctx.match[1]));
-});
-
-async function showAdminProductsList(ctx, pageNumber) {
-  const pageSize = 10;
-  const result = await getProductsPage(pageNumber, pageSize);
-  const totalPages = Math.max(1, Math.ceil(result.totalCount / pageSize));
-
-  const keyboard = new InlineKeyboard();
-
-  for (let i = 0; i < result.products.length; i += 1) {
-    const keyword = result.products[i].keyword;
-    keyboard.text(`📌 ${keyword}`, `admin_product_view:${keyword}`);
-    if (i % 2 === 1) keyboard.row();
-  }
-
-  keyboard.row();
-  if (pageNumber > 1) keyboard.text("⬅️ 上一页", `admin_products_menu:${pageNumber - 1}`);
-  keyboard.text(`📄 ${pageNumber} / ${totalPages}`, "noop");
-  if (pageNumber < totalPages) keyboard.text("下一页 ➡️", `admin_products_menu:${pageNumber + 1}`);
-
-  keyboard.row();
-  keyboard.text("➕ 上架新商品", "admin_upload_product_start");
-  keyboard.row();
-  keyboard.text("⬅️ 返回后台", "admin_back");
-
-  await ctx.reply("📦 频道转发库：商品列表（10个一页）\n点击商品可查看并删除。", { reply_markup: keyboard });
-}
-
-bot.callbackQuery(/^admin_product_view:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const keyword = String(ctx.match[1]).trim();
-  const product = await getProductByKeyword(keyword);
-
-  if (!product) {
-    await ctx.reply("未找到该商品。", { reply_markup: new InlineKeyboard().text("⬅️ 返回列表", "admin_products_menu:1") });
-    return;
-  }
-
-  const info =
-    `📌 商品关键词：${product.keyword}\n` +
-    `🧾 类型：${product.content_type}\n` +
-    `🕒 创建时间：${product.created_at ? String(product.created_at) : "未知"}\n\n` +
-    "请选择操作：";
-
-  const keyboard = new InlineKeyboard()
-    .text("🗑 删除此商品", `admin_product_delete_confirm:${product.keyword}`)
-    .row()
-    .text("⬅️ 返回列表", "admin_products_menu:1");
-
-  await ctx.reply(info, { reply_markup: keyboard });
-});
-
-bot.callbackQuery(/^admin_product_delete_confirm:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const keyword = String(ctx.match[1]).trim();
-
-  const keyboard = new InlineKeyboard()
-    .text("✅ 确认删除", `admin_product_delete_do:${keyword}`)
-    .text("❌ 取消", `admin_product_view:${keyword}`);
-
-  await ctx.reply(`确认要删除商品【${keyword}】吗？此操作不可恢复。`, { reply_markup: keyboard });
-});
-
-bot.callbackQuery(/^admin_product_delete_do:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const keyword = String(ctx.match[1]).trim();
-  await deleteProductByKeyword(keyword);
-
-  await ctx.reply(`✅ 已删除商品【${keyword}】。`, {
-    reply_markup: new InlineKeyboard().text("⬅️ 返回商品列表", "admin_products_menu:1")
-  });
-});
-
-/* -------------------- admin：上架流程（连续上传 → 手动完成） -------------------- */
-
-bot.callbackQuery("admin_upload_product_start", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  await ctx.reply("➕ 请输入商品关键词（例如 001）。");
-  await setUserState(from.id, "admin_waiting_product_keyword", {});
-});
-
-bot.callbackQuery("admin_finish_upload_product", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const stateRow = await getUserStateRow(from.id);
-  if (!stateRow || stateRow.state !== "admin_uploading_product_content") {
-    await ctx.reply("当前没有正在进行的上架流程。");
-    return;
-  }
-
-  const tempData = stateRow.temp_data ? JSON.parse(stateRow.temp_data) : {};
-  const keyword = tempData.keyword;
-  const items = Array.isArray(tempData.items) ? tempData.items : [];
-
-  if (!keyword) {
-    await ctx.reply("关键词缺失，上架失败。");
-    await clearUserState(from.id);
-    return;
-  }
-
-  if (items.length === 0) {
-    await ctx.reply("你还没有上传任何内容，请先上传内容再完成上架。");
-    return;
-  }
-
-  await upsertProduct(keyword, "media_group", JSON.stringify(items));
-
-  await ctx.reply(`✅ 上架成功：关键词 ${keyword}（共 ${items.length} 条内容）`, { reply_markup: buildAdminKeyboard() });
-  await clearUserState(from.id);
-});
-
-/* -------------------- 待处理工单（保留） -------------------- */
-
-bot.callbackQuery("admin_pending_menu", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const keyboard = new InlineKeyboard()
-    .text("🧾 首次验证工单", "admin_pending:first:1")
-    .row()
-    .text("🧾 二次认证工单", "admin_pending:second:1")
-    .row()
-    .text("🧾 VIP订单工单", "admin_pending:vip:1")
-    .row()
-    .text("⬅️ 返回后台", "admin_back");
-
-  await ctx.reply("🧾 待处理工单：请选择分类。", { reply_markup: keyboard });
-});
-
-bot.callbackQuery(/^admin_pending:(first|second|vip):(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const from = ctx.from;
-  if (!from) return;
-  if (!isAdminUserId(from.id)) return;
-
-  const kind = ctx.match[1];
-  const pageNumber = Number(ctx.match[2]);
-  const pageSize = 10;
-
-  let reviewType = "first_verify";
-  let title = "🧾 首次验证待处理";
-  if (kind === "second") {
-    reviewType = "second_verify";
-    title = "🧾 二次认证待处理";
-  }
-  if (kind === "vip") {
-    reviewType = "vip_order";
-    title = "🧾 VIP订单待处理";
-  }
-
-  const result = await getPendingReviewsByType(reviewType, pageNumber, pageSize);
-  const totalPages = Math.max(1, Math.ceil(result.totalCount / pageSize));
-
-  if (result.reviews.length === 0) {
-    await ctx.reply(`${title}\n暂无待处理 ✅`, { reply_markup: new InlineKeyboard().text("⬅️ 返回", "admin_pending_menu") });
-    return;
-  }
-
-  await ctx.reply(`${title}\n📄 第 ${pageNumber} / ${totalPages} 页`);
-
-  for (const review of result.reviews) {
-    const beijing = formatBeijingDateTime(new Date(review.submitted_at));
-    const userDisplay = `${review.first_name || ""}${review.username ? " @" + review.username : ""}`.trim();
-
-    if (reviewType === "vip_order") {
-      const text =
-        `工单 #${review.id}\n` +
-        `类型：VIP订单\n` +
-        `用户：${userDisplay}\n` +
-        `ID：${review.user_id}\n` +
-        `时间：${beijing}\n` +
-        `订单：${review.order_number || "(空)"}`;
-
-      await ctx.reply(text, { reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id) });
-    } else {
-      const text =
-        `工单 #${review.id}\n` +
-        `类型：${reviewType === "first_verify" ? "首次验证" : "二次认证"}\n` +
-        `用户：${userDisplay}\n` +
-        `ID：${review.user_id}\n` +
-        `时间：${beijing}`;
-
-      if (review.file_id) {
-        await ctx.replyWithPhoto(review.file_id, {
-          caption: text,
-          reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id)
-        });
-      } else {
-        await ctx.reply(text + "\n（无图片）", {
-          reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id)
-        });
-      }
-    }
-  }
-});
-
-/* -------------------- /c：只取消管理员自己状态 -------------------- */
-
-bot.command("c", async (ctx) => {
-  const from = ctx.from;
-  if (!from) return;
-
-  if (!isAdminUserId(from.id)) {
-    await ctx.reply("❌ 无权限。");
-    return;
-  }
-
-  await cancelAdminCurrentFlow(from.id);
-  await ctx.reply("✅ 已取消你当前的后台流程状态。", { reply_markup: buildAdminKeyboard() });
-});
-
-/* -------------------- /y /yz /v -------------------- */
-
-bot.command("y", async (ctx) => {
-  await showFirstVerifyPage(ctx);
-});
-
-bot.command("yz", async (ctx) => {
-  await showSecondVerifyPage(ctx);
-});
-
-bot.command("v", async (ctx) => {
-  await showVipPage(ctx);
-});
-
-bot.callbackQuery("go_y", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await showFirstVerifyPage(ctx);
-});
-
-bot.callbackQuery("go_yz", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await showSecondVerifyPage(ctx);
-});
-
-bot.callbackQuery("go_vip", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await showVipPage(ctx);
-});
-
-async function showFirstVerifyPage(ctx) {
-  const from = ctx.from;
-  if (!from) return;
-
-  await ensureUserExists(from.id, from.username, from.first_name);
-
-  const text =
-    "🧩【首次验证】\n\n" +
-    "✅ 上传一张图片即可完成\n" +
-    "✨ 成功后自动返回兑换页\n\n" +
-    "📤 请上传图片开始验证：";
-
-  await ctx.replyWithPhoto(FILE_ID_Y_1, { caption: text });
-  await ctx.replyWithPhoto(FILE_ID_Y_2, { caption: "📷 示例图" });
-
-  await setUserState(from.id, "waiting_first_verify_photo", {});
-}
-
-async function showSecondVerifyPage(ctx) {
-  const from = ctx.from;
-  if (!from) return;
-
-  await ensureUserExists(from.id, from.username, from.first_name);
-
-  const text =
-    "🧩【二次认证】\n\n" +
-    "✅ 通过后将不再出现\n" +
-    "⚠️ 若被驳回，需要重新提交\n\n" +
-    "📤 请上传图片开始二次认证：";
-
-  await ctx.replyWithPhoto(FILE_ID_YZ_1, { caption: text });
-  await ctx.replyWithPhoto(FILE_ID_YZ_2, { caption: "📷 示例图" });
-  await ctx.replyWithPhoto(FILE_ID_YZ_3, { caption: "📷 示例图" });
-
-  await setUserState(from.id, "waiting_second_verify_photo", {});
-}
-
-async function showVipPage(ctx) {
-  const from = ctx.from;
-  if (!from) return;
-
-  await ensureUserExists(from.id, from.username, from.first_name);
-
-  const text =
-    "🎉 喜迎新春（特价）\n\n" +
-    "💎 VIP会员特权说明：\n" +
-    "✅ 专属中转通道\n" +
-    "✅ 优先审核入群\n" +
-    "✅ 7x24小时客服支持\n" +
-    "✅ 定期福利活动\n";
-
-  const keyboard = buildVipStartKeyboard();
-  await ctx.replyWithPhoto(FILE_ID_PAYMENT, { caption: text, reply_markup: keyboard });
-}
-
-bot.callbackQuery("vip_paid_start", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const tutorialText =
-    "🧾 订单号获取教程：\n" +
-    "1）支付宝 → 账单\n" +
-    "2）进入账单详情\n" +
-    "3）更多 → 订单号\n\n" +
-    "📤 请发送订单号数字：";
-
-  await ctx.replyWithPhoto(FILE_ID_ORDER, { caption: tutorialText });
-  await setUserState(ctx.from.id, "vip_waiting_order", {});
-});
-
-/* -------------------- /dh 点击商品：兼容你的旧数据 media_group + data 字段 -------------------- */
-
-bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const from = ctx.from;
-  if (!from) return;
-
-  await ensureUserExists(from.id, from.username, from.first_name);
-  const userRow = await getUserRow(from.id);
-
-  if (userRow && userRow.is_banned) {
-    await ctx.reply("⛔ 你已被本活动封禁。\n如需继续使用，请加入会员（特价）。", {
-      reply_markup: new InlineKeyboard().text("💎 加入会员（新春特价）", "go_vip")
-    });
-    return;
-  }
-
-  const keyword = String(ctx.match[1]).trim();
-  const product = await getProductByKeyword(keyword);
-  if (!product) {
-    await ctx.reply("❌ 未找到该编号内容。");
-    return;
-  }
-
-  const currentSuccessClaimCount = userRow && Number.isFinite(userRow.click_count) ? userRow.click_count : 0;
-  const nextClaimOrdinal = currentSuccessClaimCount + 1;
-
-  const dailyVerified = await isDailyFirstVerifyValid(userRow);
-  const secondVerifyPassed = Boolean(userRow && userRow.second_verify_passed);
-
-  const rejectCountFirst = userRow && Number.isFinite(userRow.reject_count_first) ? userRow.reject_count_first : 0;
-  const needsManualReview = Boolean(userRow && userRow.needs_manual_review);
-
-  if (needsManualReview && rejectCountFirst >= 3) {
-    await ctx.reply(
-      "🕒 错误次数过多，请等待管理员审核。\n\n✅ 审核通过后即可继续兑换。\n⚠️ 请勿重复提交无关内容。",
-      { reply_markup: new InlineKeyboard().text("⬅️ 返回兑换页", "go_dh:1") }
-    );
-    return;
-  }
-
-  if (nextClaimOrdinal >= 4 && !secondVerifyPassed) {
-    await ctx.reply("🧩 继续观看前，请先完成一次二次认证。", { reply_markup: buildGoVerifyKeyboard("yz") });
-    return;
-  }
-
-  if (nextClaimOrdinal >= 2 && !dailyVerified) {
-    await ctx.reply("🧩 今日需要完成一次首次验证后继续兑换。", { reply_markup: buildGoVerifyKeyboard("y") });
-    return;
-  }
-
-  await sendProductContentCompatible(ctx, product);
-
-  const newCount = await incrementSuccessClaimCount(from.id);
-  await ctx.reply(`✅ 已领取（成功领取次数：${newCount}）`);
-});
-
-/* -------------------- 发送商品内容：兼容 data 字段 + media_group -------------------- */
+/* -------------------- 发送商品：兼容 media_group + data 字段，并且防超时 -------------------- */
 
 function parseContentDataToArray(contentDataText) {
   if (!contentDataText) return null;
@@ -943,26 +518,32 @@ function normalizeItem(item) {
   return null;
 }
 
-async function sendProductContentCompatible(ctx, productRow) {
+async function sendProductContentCompatibleWithProgress(ctx, productRow) {
   const contentType = String(productRow.content_type || "").toLowerCase();
   const itemsArray = parseContentDataToArray(productRow.content_data);
 
-  /* 1) 如果是 media_group 且数据是数组：优先 sendMediaGroup（最多 10 个一组） */
+  const createdMessageIds = [];
+
+  const sendingMessage = await ctx.reply("📦 正在发送中，请稍等…");
+  if (sendingMessage && sendingMessage.message_id) {
+    createdMessageIds.push(sendingMessage.message_id);
+  }
+
   if (contentType === "media_group" && Array.isArray(itemsArray)) {
     const normalized = itemsArray.map(normalizeItem).filter((value) => value);
 
-    const mediaOnly = normalized.filter((value) => value.type === "photo" || value.type === "video");
     const textOnly = normalized.filter((value) => value.type === "text");
+    const mediaOnly = normalized.filter((value) => value.type === "photo" || value.type === "video");
 
-    /* 先把文本按顺序发出来（你旧数据里可能第一个是 text） */
     for (const textItem of textOnly) {
       const text = String(textItem.text || "").trim();
       if (text.length > 0) {
-        await ctx.reply(text);
+        const sent = await ctx.reply(text);
+        if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
+        await sleepMilliseconds(150);
       }
     }
 
-    /* 再把媒体按 10 个一组发（Telegram 限制） */
     const chunkSize = 10;
     for (let i = 0; i < mediaOnly.length; i += chunkSize) {
       const chunk = mediaOnly.slice(i, i + chunkSize);
@@ -977,65 +558,134 @@ async function sendProductContentCompatible(ctx, productRow) {
       }
 
       if (mediaGroup.length > 0) {
-        await ctx.replyWithMediaGroup(mediaGroup);
+        const sentList = await ctx.replyWithMediaGroup(mediaGroup);
+        if (Array.isArray(sentList)) {
+          for (const sent of sentList) {
+            if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
+          }
+        }
+        await sleepMilliseconds(300);
       }
     }
 
-    return;
+    const finished = await ctx.reply("✅ 发送完毕！5 分钟后自动清理本次内容，你可以再次免费获取。", {
+      reply_markup: buildBackToDhKeyboard()
+    });
+    if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+
+    return createdMessageIds;
   }
 
-  /* 2) 如果 content_data 是数组但不是 media_group：按顺序逐条发（并按 10 条分批） */
   if (Array.isArray(itemsArray)) {
     const normalized = itemsArray.map(normalizeItem).filter((value) => value);
 
     const chunkSize = 10;
     for (let i = 0; i < normalized.length; i += chunkSize) {
       const chunk = normalized.slice(i, i + chunkSize);
+
       for (const item of chunk) {
         if (item.type === "text") {
-          await ctx.reply(item.text);
+          const sent = await ctx.reply(item.text);
+          if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
         } else if (item.type === "photo") {
-          await ctx.replyWithPhoto(item.file_id);
+          const sent = await ctx.replyWithPhoto(item.file_id);
+          if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
         } else if (item.type === "video") {
-          await ctx.replyWithVideo(item.file_id);
+          const sent = await ctx.replyWithVideo(item.file_id);
+          if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
         } else if (item.type === "document") {
-          await ctx.replyWithDocument(item.file_id);
+          const sent = await ctx.replyWithDocument(item.file_id);
+          if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
         }
+        await sleepMilliseconds(150);
       }
+
+      await sleepMilliseconds(250);
     }
-    return;
+
+    const finished = await ctx.reply("✅ 发送完毕！5 分钟后自动清理本次内容，你可以再次免费获取。", {
+      reply_markup: buildBackToDhKeyboard()
+    });
+    if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+
+    return createdMessageIds;
   }
 
-  /* 3) 单条兜底：按 content_type 发送 */
-  if (contentType === "text") {
-    await ctx.reply(String(productRow.content_data || ""));
-    return;
-  }
+  const fallbackText = String(productRow.content_data || "");
+  const sentFallback = await ctx.reply(fallbackText);
+  if (sentFallback && sentFallback.message_id) createdMessageIds.push(sentFallback.message_id);
 
-  if (contentType === "photo") {
-    await ctx.replyWithPhoto(String(productRow.content_data || ""));
-    return;
-  }
+  const finished = await ctx.reply("✅ 发送完毕！5 分钟后自动清理本次内容，你可以再次免费获取。", {
+    reply_markup: buildBackToDhKeyboard()
+  });
+  if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
 
-  if (contentType === "video") {
-    await ctx.replyWithVideo(String(productRow.content_data || ""));
-    return;
-  }
-
-  if (contentType === "document") {
-    await ctx.replyWithDocument(String(productRow.content_data || ""));
-    return;
-  }
-
-  await ctx.reply(String(productRow.content_data || ""));
+  return createdMessageIds;
 }
 
-/* -------------------- 处理消息：/y /yz 图片、VIP 订单号、admin 上架等（略：保持你现有逻辑即可） -------------------- */
-/* 你之前已经有 message handler，我这里不再重复扩写，避免超长。
-   关键是：商品发送已兼容你旧数据，/dh 点商品即可出内容。
-*/
+/* -------------------- dh_get：严重修复“发送一半死机” -------------------- */
+
+bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "📦 正在发送…", show_alert: false });
+
+  const from = ctx.from;
+  if (!from) return;
+
+  await ensureUserExists(from.id, from.username, from.first_name);
+
+  await tryAutoDeleteIfExpired(ctx);
+
+  const userRow = await getUserRow(from.id);
+  if (userRow && userRow.is_banned) {
+    await ctx.reply("⛔ 你已被本活动封禁。");
+    return;
+  }
+
+  const keyword = String(ctx.match[1]).trim();
+  const product = await getProductByKeyword(keyword);
+  if (!product) {
+    await ctx.reply("❌ 未找到该编号内容。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const currentSuccessClaimCount = userRow && Number.isFinite(userRow.click_count) ? userRow.click_count : 0;
+  const nextClaimOrdinal = currentSuccessClaimCount + 1;
+
+  const dailyVerified = await isDailyFirstVerifyValid(userRow);
+  const secondVerifyPassed = Boolean(userRow && userRow.second_verify_passed);
+
+  const rejectCountFirst = userRow && Number.isFinite(userRow.reject_count_first) ? userRow.reject_count_first : 0;
+  const needsManualReview = Boolean(userRow && userRow.needs_manual_review);
+
+  if (needsManualReview && rejectCountFirst >= 3) {
+    await ctx.reply("🕒 错误次数过多，请等待管理员审核通过后再继续兑换。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  if (nextClaimOrdinal >= 4 && !secondVerifyPassed) {
+    await ctx.reply("🧩 继续观看前，请先完成一次二次认证：发送 /yz", { reply_markup: buildGoVerifyKeyboard("yz") });
+    return;
+  }
+
+  if (nextClaimOrdinal >= 2 && !dailyVerified) {
+    await ctx.reply("🧩 今日需要完成一次首次验证：发送 /y", { reply_markup: buildGoVerifyKeyboard("y") });
+    return;
+  }
+
+  /* 关键修复：
+     - 发送内容拆批 + 延迟
+     - 发送完成提示
+     - 记录 message_id，5 分钟后清理（下次交互触发）
+  */
+  const messageIdList = await sendProductContentCompatibleWithProgress(ctx, product);
+
+  await incrementSuccessClaimCount(from.id);
+
+  await setLastSentMessagesForAutoDelete(from.id, ctx.chat.id, messageIdList, Date.now());
+});
 
 /* -------------------- noop -------------------- */
+
 bot.callbackQuery("noop", async (ctx) => {
   await ctx.answerCallbackQuery();
 });
