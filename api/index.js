@@ -63,10 +63,6 @@ function formatBeijingDateTime(date) {
   return `${year}.${month}.${day} 北京时间 ${hour}:${minute}`;
 }
 
-function sleepMilliseconds(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 function safeJsonParse(text) {
   if (!text) return null;
   try {
@@ -139,7 +135,7 @@ async function isDailyFirstVerifyValid(userRow) {
   return storedDate === today;
 }
 
-/* -------------------- user_states（状态/临时数据/当日计数/自动删除/分批发送游标） -------------------- */
+/* -------------------- user_states（状态 + temp_data 合并写） -------------------- */
 
 async function getUserStateRow(userId) {
   const client = await pool.connect();
@@ -204,7 +200,8 @@ async function setUserTempDataObjectKeepState(userId, tempDataObject) {
   await setUserState(userId, currentState, tempDataObject);
 }
 
-/* 当天领取次数 */
+/* -------------------- 当天领取次数（daily_claim_count） -------------------- */
+
 function getTodayClaimCount(tempDataObject, todayDateText) {
   if (!tempDataObject || typeof tempDataObject !== "object") return 0;
   if (!tempDataObject.daily || typeof tempDataObject.daily !== "object") return 0;
@@ -220,7 +217,8 @@ function setTodayClaimCount(tempDataObject, todayDateText, claimCount) {
   return obj;
 }
 
-/* 自动删除记录（5分钟，下次交互触发） */
+/* -------------------- 5分钟自动删除（下次交互触发） -------------------- */
+
 async function setAutoDeleteRecord(userId, chatId, messageIdList, createdAtMillis) {
   const tempData = await getUserTempDataObject(userId);
   tempData.auto_delete = {
@@ -233,6 +231,7 @@ async function setAutoDeleteRecord(userId, chatId, messageIdList, createdAtMilli
 
 async function tryAutoDeleteIfExpired(ctx) {
   if (!ctx.from) return;
+
   const tempData = await getUserTempDataObject(ctx.from.id);
   if (!tempData.auto_delete) return;
 
@@ -244,7 +243,7 @@ async function tryAutoDeleteIfExpired(ctx) {
   if (nowMillis < expireMillis) return;
 
   const chatId = Number(record.chat_id);
-  const messageIds = record.message_ids.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+  const messageIds = record.message_ids.map((v) => Number(v)).filter((v) => Number.isFinite(v));
 
   for (const messageId of messageIds) {
     try {
@@ -391,7 +390,7 @@ async function upsertProduct(keyword, contentType, contentDataText) {
   }
 }
 
-/* -------------------- UI：键盘 -------------------- */
+/* -------------------- UI 键盘 -------------------- */
 
 function buildStartKeyboard() {
   return new InlineKeyboard().text("🎁 兑换（免费）", "go_dh:1");
@@ -492,7 +491,7 @@ function buildReviewActionKeyboard(pendingId, reviewType, reviewOwnerUserId) {
   return keyboard;
 }
 
-/* -------------------- 商品内容解析（兼容你的 data 字段） -------------------- */
+/* -------------------- 商品内容解析（兼容 data 字段） -------------------- */
 
 function parseContentDataToArray(contentDataText) {
   if (!contentDataText) return null;
@@ -523,59 +522,34 @@ function normalizeItem(item) {
   return null;
 }
 
-/* -------------------- 发送会话：把媒体拆成10个一组，点继续逐批发；媒体全发完再逐条发文本 -------------------- */
-/*
-  temp_data.send_session 结构：
-  {
-    "send_session": {
-      "key": "xxx",
-      "keyword": "001",
-      "media": [{type:"photo|video", file_id:"..."}, ...],
-      "texts": ["...", "..."],
-      "media_index": 0,
-      "text_index": 0,
-      "phase": "media" | "text" | "done",
-      "total_media": 0,
-      "total_text": 0,
-      "created_at_millis": 123
-    }
-  }
-*/
+/* -------------------- 分批发送会话（send_session） -------------------- */
 
 function generateSessionKey() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-async function startSendSession(ctx, keyword, normalizedItems) {
+async function startSendSessionForProduct(userId, keyword, normalizedItems) {
   const media = normalizedItems.filter((v) => v.type === "photo" || v.type === "video");
   const texts = normalizedItems.filter((v) => v.type === "text").map((v) => String(v.text || ""));
 
-  const key = generateSessionKey();
-
   const session = {
-    key: key,
+    key: generateSessionKey(),
     keyword: keyword,
     media: media,
     texts: texts,
     media_index: 0,
     text_index: 0,
-    phase: media.length > 0 ? "media" : "text",
+    phase: media.length > 0 ? "media" : (texts.length > 0 ? "text" : "done"),
     total_media: media.length,
     total_text: texts.length,
     created_at_millis: Date.now()
   };
 
-  const tempData = await getUserTempDataObject(ctx.from.id);
+  const tempData = await getUserTempDataObject(userId);
   tempData.send_session = session;
-  await setUserTempDataObjectKeepState(ctx.from.id, tempData);
+  await setUserTempDataObjectKeepState(userId, tempData);
 
   return session;
-}
-
-async function clearSendSession(userId) {
-  const tempData = await getUserTempDataObject(userId);
-  delete tempData.send_session;
-  await setUserTempDataObjectKeepState(userId, tempData);
 }
 
 async function getSendSession(userId) {
@@ -590,7 +564,13 @@ async function saveSendSession(userId, session) {
   await setUserTempDataObjectKeepState(userId, tempData);
 }
 
-async function sendNextBatchBySession(ctx, session) {
+async function clearSendSession(userId) {
+  const tempData = await getUserTempDataObject(userId);
+  delete tempData.send_session;
+  await setUserTempDataObjectKeepState(userId, tempData);
+}
+
+async function sendNextStepBySession(ctx, session) {
   const createdMessageIds = [];
 
   if (session.phase === "media") {
@@ -620,16 +600,29 @@ async function sendNextBatchBySession(ctx, session) {
     const newIndex = startIndex + batch.length;
     session.media_index = newIndex;
 
-    const progressText = `⏳ 媒体已发送：${Math.min(newIndex, totalMedia)} / ${totalMedia}`;
-
     if (newIndex >= totalMedia) {
-      session.phase = "text";
-      const transition = await ctx.reply("📝 媒体发送完成，开始发送文字说明…");
-      if (transition && transition.message_id) createdMessageIds.push(transition.message_id);
+      if (session.total_text > 0) {
+        session.phase = "text";
+        const transition = await ctx.reply("📝 媒体发送完成，开始发送文字说明…");
+        if (transition && transition.message_id) createdMessageIds.push(transition.message_id);
+
+        const progress = await ctx.reply("点击【继续发送】开始发送文字说明：", {
+          reply_markup: buildContinueSendKeyboard(session.key)
+        });
+        if (progress && progress.message_id) createdMessageIds.push(progress.message_id);
+      } else {
+        session.phase = "done";
+        const finishedText =
+          "✅ 内容已全部发送完毕\n" +
+          "🕒 本次内容将在 5 分钟后自动清理\n" +
+          "🎁 点击下方按钮返回兑换页继续观看";
+
+        const finished = await ctx.reply(finishedText, { reply_markup: buildBackToDhKeyboard() });
+        if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+      }
     } else {
-      const progressMessage = await ctx.reply(progressText + "\n点击【继续发送】获取下一批：", {
-        reply_markup: buildContinueSendKeyboard(session.key)
-      });
+      const progressText = `⏳ 媒体已发送：${Math.min(newIndex, totalMedia)} / ${totalMedia}\n点击【继续发送】获取下一批：`;
+      const progressMessage = await ctx.reply(progressText, { reply_markup: buildContinueSendKeyboard(session.key) });
       if (progressMessage && progressMessage.message_id) createdMessageIds.push(progressMessage.message_id);
     }
 
@@ -663,7 +656,7 @@ async function sendNextBatchBySession(ctx, session) {
       const finishedText =
         "✅ 内容已全部发送完毕\n" +
         "🕒 本次内容将在 5 分钟后自动清理\n" +
-        "🎁 你可以返回兑换页继续免费观看其它资源";
+        "🎁 点击下方按钮返回兑换页继续观看";
 
       const finished = await ctx.reply(finishedText, { reply_markup: buildBackToDhKeyboard() });
       if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
@@ -673,8 +666,8 @@ async function sendNextBatchBySession(ctx, session) {
   }
 
   if (session.phase === "done") {
-    const already = await ctx.reply("✅ 本商品内容已发送完毕。", { reply_markup: buildBackToDhKeyboard() });
-    if (already && already.message_id) createdMessageIds.push(already.message_id);
+    const finished = await ctx.reply("✅ 本商品内容已发送完毕。", { reply_markup: buildBackToDhKeyboard() });
+    if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
     return createdMessageIds;
   }
 
@@ -718,7 +711,6 @@ async function showDhPage(ctx, pageNumber) {
   if (!ctx.from) return;
 
   await ensureUserExists(ctx.from.id, ctx.from.username, ctx.from.first_name);
-
   await tryAutoDeleteIfExpired(ctx);
 
   const userRow = await getUserRow(ctx.from.id);
@@ -741,7 +733,7 @@ async function showDhPage(ctx, pageNumber) {
   await ctx.reply(text, { reply_markup: buildDhKeyboard(result.products, pageNumber, totalPages, dailyVerified) });
 }
 
-/* -------------------- /y /yz 页面（仍保留命令，但系统自动触发也会调用） -------------------- */
+/* -------------------- /y /yz 展示（系统自动触发也会调用） -------------------- */
 
 async function showFirstVerifyPage(ctx) {
   if (!ctx.from) return;
@@ -824,16 +816,14 @@ bot.callbackQuery("vip_paid_start", async (ctx) => {
   await setUserState(ctx.from.id, "vip_waiting_order", {});
 });
 
-/* -------------------- /admin -------------------- */
+/* -------------------- /admin 后台 -------------------- */
 
 bot.command("admin", async (ctx) => {
   if (!ctx.from) return;
-
   if (!isAdminUserId(ctx.from.id)) {
     await ctx.reply("❌ 无权限。");
     return;
   }
-
   await ctx.reply("🛠 管理员后台：请选择功能。", { reply_markup: buildAdminKeyboard() });
 });
 
@@ -877,7 +867,6 @@ bot.callbackQuery(/^admin_product_view:(.+)$/, async (ctx) => {
 
   const keyword = String(ctx.match[1]).trim();
   const product = await getProductByKeyword(keyword);
-
   if (!product) {
     await ctx.reply("未找到该商品。");
     return;
@@ -903,7 +892,6 @@ bot.callbackQuery(/^admin_product_delete_confirm:(.+)$/, async (ctx) => {
   if (!isAdminUserId(ctx.from.id)) return;
 
   const keyword = String(ctx.match[1]).trim();
-
   const keyboard = new InlineKeyboard()
     .text("✅ 确认删除", `admin_product_delete_do:${keyword}`)
     .text("❌ 取消", `admin_product_view:${keyword}`);
@@ -918,8 +906,9 @@ bot.callbackQuery(/^admin_product_delete_do:(.+)$/, async (ctx) => {
 
   const keyword = String(ctx.match[1]).trim();
   await deleteProductByKeyword(keyword);
-
-  await ctx.reply(`✅ 已删除商品【${keyword}】。`, { reply_markup: new InlineKeyboard().text("⬅️ 返回商品列表", "admin_products_menu:1") });
+  await ctx.reply(`✅ 已删除商品【${keyword}】。`, {
+    reply_markup: new InlineKeyboard().text("⬅️ 返回商品列表", "admin_products_menu:1")
+  });
 });
 
 bot.callbackQuery("admin_upload_product_start", async (ctx) => {
@@ -1034,7 +1023,7 @@ bot.callbackQuery(/^admin_pending:(first|second|vip):(\d+)$/, async (ctx) => {
   }
 });
 
-/* -------------------- /c：取消管理员自己当前状态 -------------------- */
+/* -------------------- /c（管理员取消自己流程） -------------------- */
 
 bot.command("c", async (ctx) => {
   if (!ctx.from) return;
@@ -1046,7 +1035,7 @@ bot.command("c", async (ctx) => {
   await ctx.reply("✅ 已取消你当前的后台流程状态。");
 });
 
-/* -------------------- /cz：管理员前端测试重置（不清库） -------------------- */
+/* -------------------- /cz（管理员测试重置，不清库） -------------------- */
 
 bot.command("cz", async (ctx) => {
   if (!ctx.from) return;
@@ -1078,19 +1067,14 @@ bot.command("cz", async (ctx) => {
   await ctx.reply("✅ 测试重置完成：你已恢复为全新前端状态（不影响商品库与后台数据）。");
 });
 
-/* -------------------- 审核驳回：强制打开 /y 或 /yz + 文案 -------------------- */
+/* -------------------- 审核：通过/驳回/封禁/删除（驳回强制打开 y/yz） -------------------- */
 
 async function forceOpenFirstVerifyForUser(userId) {
   await bot.api.sendMessage(
     userId,
     "❌ 审核未通过\n\n请重新上传正确的示例图片再试 ✅\n⚠️ 请勿上传无关图片或重复无效图片，多次违规将会被封禁。\n\n📤 已为你重新打开【首次验证】，请直接上传图片："
   );
-  await bot.api.sendPhoto(userId, FILE_ID_Y_1, {
-    caption:
-      "🧩【首次验证】\n\n" +
-      "✅ 上传一张图片即可完成\n" +
-      "📤 请直接上传图片："
-  });
+  await bot.api.sendPhoto(userId, FILE_ID_Y_1, { caption: "🧩【首次验证】\n\n📤 请直接上传图片：" });
   await bot.api.sendPhoto(userId, FILE_ID_Y_2, { caption: "📷 示例图" });
   await setUserState(userId, "waiting_first_verify_photo", {});
 }
@@ -1100,12 +1084,7 @@ async function forceOpenSecondVerifyForUser(userId) {
     userId,
     "❌ 审核未通过\n\n请重新上传正确的示例图片再试 ✅\n⚠️ 请勿上传无关图片或重复无效图片，多次违规将会被封禁。\n\n📤 已为你重新打开【二次认证】，请直接上传图片："
   );
-  await bot.api.sendPhoto(userId, FILE_ID_YZ_1, {
-    caption:
-      "🧩【二次认证】\n\n" +
-      "✅ 通过后终身不再出现\n" +
-      "📤 请直接上传图片："
-  });
+  await bot.api.sendPhoto(userId, FILE_ID_YZ_1, { caption: "🧩【二次认证】\n\n📤 请直接上传图片：" });
   await bot.api.sendPhoto(userId, FILE_ID_YZ_2, { caption: "📷 示例图" });
   await bot.api.sendPhoto(userId, FILE_ID_YZ_3, { caption: "📷 示例图" });
   await setUserState(userId, "waiting_second_verify_photo", {});
@@ -1258,10 +1237,10 @@ bot.callbackQuery(/^review_delete:(\d+):(.+)$/, async (ctx) => {
   await ctx.reply(`🗑 已删除测试工单 #${pendingId}`);
 });
 
-/* -------------------- /dh 点击商品：当天第2次跳 /y，第5次跳 /yz；否则开启分批发送会话 -------------------- */
+/* -------------------- /dh 点击商品：当天第2次跳 /y，第5次跳 /yz；否则启动分批发送会话 -------------------- */
 
 bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery({ text: "📦 正在准备…", show_alert: false });
+  await ctx.answerCallbackQuery({ text: "📦 正在处理…", show_alert: false });
   if (!ctx.from) return;
 
   await ensureUserExists(ctx.from.id, ctx.from.username, ctx.from.first_name);
@@ -1311,7 +1290,6 @@ bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
     return;
   }
 
-  /* 开始发送会话：先媒体后文本，媒体每批10个，用户点继续 */
   const itemsArray = parseContentDataToArray(product.content_data);
   if (!Array.isArray(itemsArray)) {
     await ctx.reply("❌ 内容数据异常（无法解析），请稍后重试或联系管理员。", { reply_markup: buildBackToDhKeyboard() });
@@ -1326,12 +1304,11 @@ bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
 
   await ctx.reply("📦 正在为你准备内容，请稍等…");
 
-  const session = await startSendSession(ctx, keyword, normalized);
+  const session = await startSendSessionForProduct(ctx.from.id, keyword, normalized);
 
-  /* 立即发送第一批（只发一批，不超时） */
   let createdMessageIds = [];
   try {
-    createdMessageIds = await sendNextBatchBySession(ctx, session);
+    createdMessageIds = await sendNextStepBySession(ctx, session);
   } catch (e) {
     await clearSendSession(ctx.from.id);
     await ctx.reply("❌ 发送失败，请稍后重试。", { reply_markup: buildBackToDhKeyboard() });
@@ -1340,11 +1317,9 @@ bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
 
   await saveSendSession(ctx.from.id, session);
 
-  /* 当天领取次数：只在真正开始发送后记为一次领取（你允许重新获取，所以也可只在“发送完成”后加；这里按开始一次会话算一次领取） */
   const newTemp = setTodayClaimCount(tempData, today, nextOrdinal);
   await setUserTempDataObjectKeepState(ctx.from.id, newTemp);
 
-  /* 记录5分钟删除（记录当前这次发送产生的消息） */
   if (ctx.chat && ctx.chat.id && createdMessageIds.length > 0) {
     await setAutoDeleteRecord(ctx.from.id, ctx.chat.id, createdMessageIds, Date.now());
   }
@@ -1367,13 +1342,13 @@ bot.callbackQuery(/^send_more:(.+)$/, async (ctx) => {
 
   const key = String(ctx.match[1]).trim();
   if (session.key !== key) {
-    await ctx.reply("❌ 会话已过期或不匹配，请返回兑换页重新选择商品。", { reply_markup: buildBackToDhKeyboard() });
+    await ctx.reply("❌ 本次发送已过期或已更新，请返回兑换页重新选择商品。", { reply_markup: buildBackToDhKeyboard() });
     return;
   }
 
   let createdMessageIds = [];
   try {
-    createdMessageIds = await sendNextBatchBySession(ctx, session);
+    createdMessageIds = await sendNextStepBySession(ctx, session);
   } catch (e) {
     await ctx.reply("❌ 本批发送失败，请稍后重试。", { reply_markup: buildContinueSendKeyboard(session.key) });
     return;
@@ -1390,7 +1365,7 @@ bot.callbackQuery(/^send_more:(.+)$/, async (ctx) => {
   }
 });
 
-/* -------------------- message：处理 /y /yz 图片、驳回后重传也出工单；admin 上架；VIP订单；file_id -------------------- */
+/* -------------------- message：处理 /y /yz 上传、admin 上架、VIP订单、file_id -------------------- */
 
 async function sendAdminReviewTicketForPhoto(reviewType, user, fileId) {
   const beijingTime = formatBeijingDateTime(getBeijingNowDate());
@@ -1423,22 +1398,16 @@ async function sendAdminReviewTicketForPhoto(reviewType, user, fileId) {
 function extractPureContentFromMessage(message) {
   if (!message) return null;
 
-  if (message.text) {
-    return { type: "text", text: String(message.text) };
-  }
+  if (message.text) return { type: "text", text: String(message.text) };
 
   if (message.photo && message.photo.length > 0) {
     const photo = message.photo[message.photo.length - 1];
     return { type: "photo", data: photo.file_id };
   }
 
-  if (message.video && message.video.file_id) {
-    return { type: "video", data: message.video.file_id };
-  }
+  if (message.video && message.video.file_id) return { type: "video", data: message.video.file_id };
 
-  if (message.document && message.document.file_id) {
-    return { type: "document", data: message.document.file_id };
-  }
+  if (message.document && message.document.file_id) return { type: "document", data: message.document.file_id };
 
   return null;
 }
@@ -1587,7 +1556,6 @@ bot.on("message", async (ctx) => {
     }
 
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
-
     await updateUserFields(ctx.from.id, { second_verify_passed: true });
 
     await ctx.reply("✅ 二次认证完成！🎉");
@@ -1622,6 +1590,6 @@ bot.catch((err) => {
   }
 });
 
-/* -------------------- 导出给 Vercel -------------------- */
+/* -------------------- 导出 -------------------- */
 
 module.exports = webhookCallback(bot, "http");
