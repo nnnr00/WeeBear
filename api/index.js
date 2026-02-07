@@ -318,6 +318,16 @@ async function createPendingReview({ userId, username, firstName, reviewType, fi
   }
 }
 
+async function getPendingReviewById(pendingId) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`SELECT * FROM pending_reviews WHERE id = $1`, [pendingId]);
+    return result.rows[0] || null;
+  } finally {
+    client.release();
+  }
+}
+
 async function updatePendingReviewStatus(pendingId, status) {
   const client = await pool.connect();
   try {
@@ -550,7 +560,7 @@ function normalizeItem(item) {
   return null;
 }
 
-/* -------------------- 关键修复：所有交互入口都先触发一次清理检查 -------------------- */
+/* -------------------- 全局：任何交互都先触发一次清理检查 -------------------- */
 
 bot.use(async (ctx, next) => {
   try {
@@ -702,7 +712,7 @@ bot.callbackQuery("vip_paid_start", async (ctx) => {
   await setUserState(ctx.from.id, "vip_waiting_order", await getUserTempDataObject(ctx.from.id));
 });
 
-/* -------------------- /admin（后台入口 + 三模块回调） -------------------- */
+/* -------------------- /admin -------------------- */
 
 bot.command("admin", async (ctx) => {
   if (!ctx.from) return;
@@ -717,21 +727,17 @@ bot.callbackQuery("admin_back", async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
   if (!isAdminUserId(ctx.from.id)) return;
-
   await ctx.reply("🛠 管理员后台：请选择功能。", { reply_markup: buildAdminKeyboard() });
 });
 
-/* admin: file_id */
 bot.callbackQuery("admin_get_file_id", async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
   if (!isAdminUserId(ctx.from.id)) return;
-
   await ctx.reply("🆔 请发送图片，我将返回对应的 file_id。");
   await setUserState(ctx.from.id, "admin_waiting_file_id_photo", await getUserTempDataObject(ctx.from.id));
 });
 
-/* admin: 商品列表 */
 bot.callbackQuery(/^admin_products_menu:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
@@ -747,7 +753,6 @@ bot.callbackQuery(/^admin_products_menu:(\d+)$/, async (ctx) => {
   });
 });
 
-/* admin: 查看商品与删除确认 */
 bot.callbackQuery(/^admin_product_view:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
@@ -800,7 +805,6 @@ bot.callbackQuery(/^admin_product_delete_do:(.+)$/, async (ctx) => {
   });
 });
 
-/* admin: 上架 */
 bot.callbackQuery("admin_upload_product_start", async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
@@ -841,7 +845,6 @@ bot.callbackQuery("admin_finish_upload_product", async (ctx) => {
   await clearUserState(ctx.from.id);
 });
 
-/* admin: 待处理 */
 bot.callbackQuery("admin_pending_menu", async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!ctx.from) return;
@@ -884,79 +887,573 @@ bot.callbackQuery(/^admin_pending:(first|second|vip):(\d+)$/, async (ctx) => {
     const when = formatBeijingDateTime(new Date(review.submitted_at));
     const userDisplay = `${review.first_name || ""}${review.username ? " @" + review.username : ""}`.trim();
 
-    if (reviewType === "vip_order") {
-      const text =
-        `工单 #${review.id}\n` +
-        `类型：VIP订单\n` +
-        `用户：${userDisplay}\n` +
-        `ID：${review.user_id}\n` +
-        `时间：${when}\n` +
-        `订单：${review.order_number || "(空)"}`;
+    const caption =
+      `工单 #${review.id}\n` +
+      `类型：${review.review_type}\n` +
+      `用户：${userDisplay}\n` +
+      `ID：${review.user_id}\n` +
+      `时间：${when}` +
+      (review.order_number ? `\n订单：${review.order_number}` : "");
 
-      await ctx.reply(text, { reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id) });
+    if (review.file_id) {
+      await ctx.replyWithPhoto(review.file_id, {
+        caption,
+        reply_markup: buildReviewActionKeyboard(review.id, review.review_type, review.user_id)
+      });
     } else {
-      const caption =
-        `工单 #${review.id}\n` +
-        `类型：${reviewType === "first_verify" ? "首次验证" : "二次认证"}\n` +
-        `用户：${userDisplay}\n` +
-        `ID：${review.user_id}\n` +
-        `时间：${when}`;
-
-      if (review.file_id) {
-        await ctx.replyWithPhoto(review.file_id, { caption, reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id) });
-      } else {
-        await ctx.reply(caption, { reply_markup: buildReviewActionKeyboard(review.id, reviewType, review.user_id) });
-      }
+      await ctx.reply(caption, {
+        reply_markup: buildReviewActionKeyboard(review.id, review.review_type, review.user_id)
+      });
     }
   }
 });
 
-/* -------------------- /c /cz -------------------- */
+/* -------------------- 工单四按钮（通过/驳回/封禁/删除） -------------------- */
 
-bot.command("c", async (ctx) => {
+bot.callbackQuery(/^review_ok:(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
   if (!ctx.from) return;
-  if (!isAdminUserId(ctx.from.id)) {
-    await ctx.reply("❌ 无权限。");
-    return;
+  if (!isAdminUserId(ctx.from.id)) return;
+
+  const pendingId = Number(ctx.match[1]);
+  const reviewType = String(ctx.match[2]);
+
+  await updatePendingReviewStatus(pendingId, "approved");
+
+  const review = await getPendingReviewById(pendingId);
+  if (review) {
+    if (reviewType === "first_verify") {
+      await updateUserFields(review.user_id, { needs_manual_review: false });
+    }
+    if (reviewType === "second_verify") {
+      await updateUserFields(review.user_id, { second_verify_passed: true });
+    }
+    if (reviewType === "vip_order") {
+      await updateUserFields(review.user_id, { is_vip: true });
+    }
   }
-  await clearUserState(ctx.from.id);
-  await ctx.reply("✅ 已取消你当前的后台流程状态。");
+
+  await ctx.reply(`✅ 已通过工单 #${pendingId}`);
 });
 
-bot.command("cz", async (ctx) => {
+bot.callbackQuery(/^review_reject:(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
   if (!ctx.from) return;
-  if (!isAdminUserId(ctx.from.id)) {
-    await ctx.reply("❌ 无权限。");
+  if (!isAdminUserId(ctx.from.id)) return;
+
+  const pendingId = Number(ctx.match[1]);
+  const reviewType = String(ctx.match[2]);
+
+  await updatePendingReviewStatus(pendingId, "rejected");
+
+  const review = await getPendingReviewById(pendingId);
+  if (!review) {
+    await ctx.reply("工单不存在。");
     return;
   }
+
+  if (reviewType === "first_verify") {
+    const userRow = await getUserRow(review.user_id);
+    const currentReject = userRow && Number.isFinite(userRow.reject_count_first) ? userRow.reject_count_first : 0;
+    const nextReject = currentReject + 1;
+    const needsManualReview = nextReject >= 3;
+
+    await updateUserFields(review.user_id, {
+      reject_count_first: nextReject,
+      needs_manual_review: needsManualReview
+    });
+
+    await bot.api.sendMessage(
+      review.user_id,
+      "❌ 审核未通过\n\n请重新上传正确的示例图片再试 ✅\n⚠️ 请勿上传无关图片或重复无效图片，多次违规将会被封禁。\n\n📤 已为你重新打开【首次验证】，请直接上传图片："
+    );
+    await bot.api.sendPhoto(review.user_id, FILE_ID_Y_1, { caption: "🧩【首次验证】\n\n📤 请直接上传图片：" });
+    await bot.api.sendPhoto(review.user_id, FILE_ID_Y_2, { caption: "📷 示例图" });
+
+    await setUserState(review.user_id, "waiting_first_verify_photo", await getUserTempDataObject(review.user_id));
+  }
+
+  if (reviewType === "second_verify") {
+    const userRow = await getUserRow(review.user_id);
+    const currentReject = userRow && Number.isFinite(userRow.reject_count_second) ? userRow.reject_count_second : 0;
+    const nextReject = currentReject + 1;
+
+    await updateUserFields(review.user_id, {
+      reject_count_second: nextReject,
+      second_verify_passed: false
+    });
+
+    await bot.api.sendMessage(
+      review.user_id,
+      "❌ 审核未通过\n\n请重新上传正确的示例图片再试 ✅\n⚠️ 请勿上传无关图片或重复无效图片，多次违规将会被封禁。\n\n📤 已为你重新打开【二次认证】，请直接上传图片："
+    );
+    await bot.api.sendPhoto(review.user_id, FILE_ID_YZ_1, { caption: "🧩【二次认证】\n\n📤 请直接上传图片：" });
+    await bot.api.sendPhoto(review.user_id, FILE_ID_YZ_2, { caption: "📷 示例图" });
+    await bot.api.sendPhoto(review.user_id, FILE_ID_YZ_3, { caption: "📷 示例图" });
+
+    await setUserState(review.user_id, "waiting_second_verify_photo", await getUserTempDataObject(review.user_id));
+  }
+
+  await ctx.reply(`❌ 已驳回工单 #${pendingId}（已强制引导用户重新验证）`);
+});
+
+bot.callbackQuery(/^review_ban:(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  if (!ctx.from) return;
+  if (!isAdminUserId(ctx.from.id)) return;
+
+  const pendingId = Number(ctx.match[1]);
+  const review = await getPendingReviewById(pendingId);
+  if (!review) {
+    await ctx.reply("工单不存在。");
+    return;
+  }
+
+  await updateUserFields(review.user_id, { is_banned: true });
+  await updatePendingReviewStatus(pendingId, "approved");
+
+  await bot.api.sendMessage(review.user_id, "⛔ 你已被本活动封禁。\n如需继续使用，请发送 /v 加入会员。");
+  await ctx.reply(`⛔ 已封禁用户并处理工单 #${pendingId}`);
+});
+
+bot.callbackQuery(/^review_delete:(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  if (!ctx.from) return;
+  if (!isAdminUserId(ctx.from.id)) return;
+
+  const pendingId = Number(ctx.match[1]);
+  const review = await getPendingReviewById(pendingId);
+  if (!review) {
+    await ctx.reply("工单不存在。");
+    return;
+  }
+
+  if (!isAdminUserId(review.user_id)) {
+    await ctx.reply("仅允许删除你自己测试产生的工单。");
+    return;
+  }
+
+  await deletePendingReview(pendingId);
+  await ctx.reply(`🗑 已删除测试工单 #${pendingId}`);
+});
+
+/* -------------------- /dh 点击商品 与 /dh 继续发送（分批10个媒体） -------------------- */
+
+async function sendNextBySessionAndUpdate(ctx, session) {
+  const createdMessageIds = [];
+
+  if (session.phase === "media") {
+    const startIndex = Number(session.media_index) || 0;
+    const totalMedia = Number(session.total_media) || 0;
+
+    const batch = session.media.slice(startIndex, startIndex + 10);
+
+    const mediaGroup = [];
+    for (const item of batch) {
+      if (item.type === "photo") mediaGroup.push(InputMediaBuilder.photo(item.file_id));
+      if (item.type === "video") mediaGroup.push(InputMediaBuilder.video(item.file_id));
+    }
+
+    if (mediaGroup.length > 0) {
+      const sentList = await ctx.replyWithMediaGroup(mediaGroup);
+      if (Array.isArray(sentList)) {
+        for (const sent of sentList) {
+          if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
+        }
+      }
+    }
+
+    const newIndex = startIndex + batch.length;
+    session.media_index = newIndex;
+
+    if (newIndex >= totalMedia) {
+      if (session.total_text > 0) {
+        session.phase = "text";
+        const transition = await ctx.reply("📝 媒体发送完成，开始发送文字说明…");
+        if (transition && transition.message_id) createdMessageIds.push(transition.message_id);
+
+        const prompt = await ctx.reply("点击【继续发送】开始发送文字说明：", {
+          reply_markup: buildContinueSendKeyboard(session.key)
+        });
+        if (prompt && prompt.message_id) createdMessageIds.push(prompt.message_id);
+      } else {
+        session.phase = "done";
+        const finished = await ctx.reply(
+          "✅ 内容已全部发送完毕\n🕒 本次内容将在 5 分钟后自动清理\n📌 到时间后你再点任意按钮或命令，将自动清理\n🎁 点击下方按钮返回兑换页",
+          { reply_markup: buildBackToDhKeyboard() }
+        );
+        if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+      }
+    } else {
+      const progress = await ctx.reply(
+        `⏳ 媒体已发送：${Math.min(newIndex, totalMedia)} / ${totalMedia}\n点击【继续发送】获取下一批：`,
+        { reply_markup: buildContinueSendKeyboard(session.key) }
+      );
+      if (progress && progress.message_id) createdMessageIds.push(progress.message_id);
+    }
+
+    await setSendSession(ctx.from.id, session);
+    if (session.phase === "done") await clearSendSession(ctx.from.id);
+    return createdMessageIds;
+  }
+
+  if (session.phase === "text") {
+    const startIndex = Number(session.text_index) || 0;
+    const totalText = Number(session.total_text) || 0;
+
+    if (startIndex >= totalText) {
+      session.phase = "done";
+    } else {
+      const sent = await ctx.reply(String(session.texts[startIndex] || ""));
+      if (sent && sent.message_id) createdMessageIds.push(sent.message_id);
+
+      session.text_index = startIndex + 1;
+
+      if (session.text_index < totalText) {
+        const progress = await ctx.reply(`📝 文本发送中：${session.text_index} / ${totalText}\n点击【继续发送】继续：`, {
+          reply_markup: buildContinueSendKeyboard(session.key)
+        });
+        if (progress && progress.message_id) createdMessageIds.push(progress.message_id);
+      } else {
+        session.phase = "done";
+      }
+    }
+
+    if (session.phase === "done") {
+      const finished = await ctx.reply(
+        "✅ 内容已全部发送完毕\n🕒 本次内容将在 5 分钟后自动清理\n📌 到时间后你再点任意按钮或命令，将自动清理\n🎁 点击下方按钮返回兑换页",
+        { reply_markup: buildBackToDhKeyboard() }
+      );
+      if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+    }
+
+    await setSendSession(ctx.from.id, session);
+    if (session.phase === "done") await clearSendSession(ctx.from.id);
+    return createdMessageIds;
+  }
+
+  if (session.phase === "done") {
+    const finished = await ctx.reply("✅ 本商品内容已发送完毕。", { reply_markup: buildBackToDhKeyboard() });
+    if (finished && finished.message_id) createdMessageIds.push(finished.message_id);
+    await clearSendSession(ctx.from.id);
+    return createdMessageIds;
+  }
+
+  return createdMessageIds;
+}
+
+bot.callbackQuery(/^dh_get:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "📦 正在准备…", show_alert: false });
+  if (!ctx.from) return;
 
   await ensureUserExists(ctx.from.id, ctx.from.username, ctx.from.first_name);
 
-  await updateUserFields(ctx.from.id, {
-    first_verify_passed: false,
-    second_verify_passed: false,
-    first_verify_date: null,
-    first_verify_time: null,
-    reject_count_first: 0,
-    reject_count_second: 0,
-    needs_manual_review: false
-  });
+  const userRow = await getUserRow(ctx.from.id);
+  if (userRow && userRow.is_banned) {
+    await ctx.reply("⛔ 你已被封禁。如需继续使用请发送 /v。", { reply_markup: buildVipEntryKeyboard() });
+    return;
+  }
 
+  const keyword = String(ctx.match[1]).trim();
+  const product = await getProductByKeyword(keyword);
+  if (!product) {
+    await ctx.reply("❌ 未找到该编号内容。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const today = formatBeijingDateOnly(getBeijingNowDate());
   const tempData = await getUserTempDataObject(ctx.from.id);
-  delete tempData.daily;
-  delete tempData.auto_delete;
-  delete tempData.send_session;
-  await setUserTempDataObjectKeepState(ctx.from.id, tempData);
+  const todayCount = getTodayClaimCount(tempData, today);
+  const nextOrdinal = todayCount + 1;
 
-  await clearUserState(ctx.from.id);
-  await ctx.reply("✅ 测试重置完成：你已恢复为全新前端状态（不影响商品库与后台数据）。");
+  const dailyVerified = await isDailyFirstVerifyValid(userRow);
+  const secondVerifyPassed = Boolean(userRow && userRow.second_verify_passed);
+
+  const rejectCountFirst = userRow && Number.isFinite(userRow.reject_count_first) ? userRow.reject_count_first : 0;
+  const needsManualReview = Boolean(userRow && userRow.needs_manual_review);
+
+  if (needsManualReview && rejectCountFirst >= 3) {
+    await ctx.reply("🕒 错误次数过多，请等待管理员审核通过后继续。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  if (nextOrdinal >= 5 && !secondVerifyPassed) {
+    await ctx.reply("🧩 需要完成二次认证后继续观看，正在打开二次认证页…");
+    await showSecondVerifyPage(ctx);
+    return;
+  }
+
+  if (nextOrdinal >= 2 && !dailyVerified) {
+    await ctx.reply("🧩 今日需要完成一次首次验证，正在打开验证页…");
+    await showFirstVerifyPage(ctx);
+    return;
+  }
+
+  const itemsArray = parseContentDataToArray(product.content_data);
+  if (!Array.isArray(itemsArray)) {
+    await ctx.reply("❌ 内容数据异常（无法解析），请稍后重试。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const normalized = itemsArray.map(normalizeItem).filter((v) => v);
+  if (normalized.length === 0) {
+    await ctx.reply("❌ 内容为空或格式不支持。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const media = normalized.filter((v) => v.type === "photo" || v.type === "video");
+  const texts = normalized.filter((v) => v.type === "text").map((v) => String(v.text || ""));
+
+  const session = {
+    key: generateSessionKey(),
+    keyword,
+    media,
+    texts,
+    media_index: 0,
+    text_index: 0,
+    phase: media.length > 0 ? "media" : (texts.length > 0 ? "text" : "done"),
+    total_media: media.length,
+    total_text: texts.length,
+    created_at_millis: Date.now()
+  };
+
+  await setSendSession(ctx.from.id, session);
+
+  await mergeUserTempData(ctx.from.id, { daily: { date: today, claim_count: nextOrdinal } });
+
+  const startMsg = await ctx.reply("📦 开始发送内容（每批最多 10 个媒体），请按提示点击【继续发送】…");
+  const ids = [];
+  if (startMsg && startMsg.message_id) ids.push(startMsg.message_id);
+
+  const batchIds = await sendNextBySessionAndUpdate(ctx, session);
+  for (const i of batchIds) ids.push(i);
+
+  if (ctx.chat && ctx.chat.id) {
+    await appendAutoDeleteMessageIds(ctx.from.id, ctx.chat.id, ids);
+  }
 });
 
-/* -------------------- /dh 商品点击与继续发送（此处略：与你之前最终版一致，确保 send_session + auto_delete 工作） -------------------- */
-/* 为避免超长，这里保留你之前已验证的分批发送实现逻辑模块。
-   如果你需要我把“/dh_get + send_more + sendNextBySessionAndUpdate + 验证/工单/驳回”完整并入这一版，我可以继续输出第二段文件。
-   但你当前 admin 无反应的问题，主要是前面这些 handler 缺失。此版已补齐 admin 回调与状态机入口。
-*/
+bot.callbackQuery(/^send_more:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "▶️ 继续发送中…", show_alert: false });
+  if (!ctx.from) return;
+
+  const session = await getSendSession(ctx.from.id);
+  if (!session) {
+    await ctx.reply("❌ 当前没有可继续发送的内容，请返回兑换页重新选择商品。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const key = String(ctx.match[1]).trim();
+  if (session.key !== key) {
+    await ctx.reply("❌ 本次发送已过期或已更新，请返回兑换页重新选择商品。", { reply_markup: buildBackToDhKeyboard() });
+    return;
+  }
+
+  const ids = await sendNextBySessionAndUpdate(ctx, session);
+  if (ctx.chat && ctx.chat.id) {
+    await appendAutoDeleteMessageIds(ctx.from.id, ctx.chat.id, ids);
+  }
+});
+
+/* -------------------- message：验证上传 / admin 上架 / file_id / VIP订单 -------------------- */
+
+async function sendAdminReviewTicketForPhoto(reviewType, user, fileId) {
+  const beijingTime = formatBeijingDateTime(getBeijingNowDate());
+  const caption =
+    (reviewType === "first_verify" ? "🧩 首次验证工单" : "🧩 二次认证工单") +
+    "\n\n" +
+    `用户：${user.first_name || ""}${user.username ? " @" + user.username : ""}\n` +
+    `ID：${user.id}\n` +
+    `时间：${beijingTime}`;
+
+  for (const adminId of ADMIN_IDS) {
+    const sent = await bot.api.sendPhoto(adminId, fileId, { caption });
+    const pendingId = await createPendingReview({
+      userId: user.id,
+      username: user.username,
+      firstName: user.first_name,
+      reviewType,
+      fileId,
+      orderNumber: null,
+      messageId: sent && sent.message_id ? sent.message_id : null
+    });
+
+    await bot.api.sendMessage(adminId, `工单操作：#${pendingId}`, {
+      reply_markup: buildReviewActionKeyboard(pendingId, reviewType, user.id)
+    });
+  }
+}
+
+function extractPureContentFromMessage(message) {
+  if (!message) return null;
+  if (message.text) return { type: "text", text: String(message.text) };
+  if (message.photo && message.photo.length > 0) return { type: "photo", data: message.photo[message.photo.length - 1].file_id };
+  if (message.video && message.video.file_id) return { type: "video", data: message.video.file_id };
+  if (message.document && message.document.file_id) return { type: "document", data: message.document.file_id };
+  return null;
+}
+
+bot.on("message", async (ctx) => {
+  if (!ctx.from) return;
+  await ensureUserExists(ctx.from.id, ctx.from.username, ctx.from.first_name);
+
+  const stateRow = await getUserStateRow(ctx.from.id);
+  const currentState = stateRow ? String(stateRow.state) : "idle";
+
+  /* admin: file_id */
+  if (currentState === "admin_waiting_file_id_photo") {
+    if (ctx.message.photo && ctx.message.photo.length > 0) {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      await ctx.reply(`🆔 file_id：\n${photo.file_id}`, { reply_markup: buildAdminKeyboard() });
+      await clearUserState(ctx.from.id);
+      return;
+    }
+    await ctx.reply("❌ 请发送图片。");
+    return;
+  }
+
+  /* admin: 等关键词 */
+  if (currentState === "admin_waiting_product_keyword") {
+    if (!isAdminUserId(ctx.from.id)) {
+      await ctx.reply("❌ 无权限。");
+      await clearUserState(ctx.from.id);
+      return;
+    }
+    const keyword = ctx.message.text ? String(ctx.message.text).trim() : "";
+    if (!keyword) {
+      await ctx.reply("❌ 请输入有效关键词（例如 001）。");
+      return;
+    }
+
+    await setUserState(ctx.from.id, "admin_uploading_product_content", {
+      keyword,
+      items: []
+    });
+
+    const keyboard = new InlineKeyboard()
+      .text("✅ 完成上架", "admin_finish_upload_product")
+      .row()
+      .text("⬅️ 返回商品列表", "admin_products_menu:1");
+
+    await ctx.reply(`✅ 已设置关键词：${keyword}\n📤 请连续上传内容，完成后点击【完成上架】。`, { reply_markup: keyboard });
+    return;
+  }
+
+  /* admin: 收内容 */
+  if (currentState === "admin_uploading_product_content") {
+    if (!isAdminUserId(ctx.from.id)) {
+      await ctx.reply("❌ 无权限。");
+      await clearUserState(ctx.from.id);
+      return;
+    }
+
+    const temp = safeJsonParse(stateRow.temp_data) || {};
+    const keyword = temp.keyword;
+    const items = Array.isArray(temp.items) ? temp.items : [];
+
+    const captured = extractPureContentFromMessage(ctx.message);
+    if (!captured) {
+      await ctx.reply("❌ 暂不支持该内容类型，请发送文本/图片/视频/文件。");
+      return;
+    }
+
+    items.push(captured);
+    await setUserState(ctx.from.id, "admin_uploading_product_content", { keyword, items });
+    await ctx.reply(`📦 已加入队列：当前共 ${items.length} 条内容。继续上传或点击【完成上架】。`);
+    return;
+  }
+
+  /* VIP: 订单号 */
+  if (currentState === "vip_waiting_order") {
+    const text = ctx.message.text ? String(ctx.message.text).trim() : "";
+    const digits = text.replace(/\s+/g, "");
+    if (!/^\d+$/.test(digits)) {
+      await ctx.reply("❌ 未识别成功，请仅发送数字订单号。");
+      return;
+    }
+    if (!digits.startsWith("20260")) {
+      await ctx.reply("❌ 未识别成功，请检查后重新发送订单号。");
+      return;
+    }
+
+    await ctx.reply("✅ 订单已提交验证。", {
+      reply_markup: new InlineKeyboard().url("🚪 加入会员群", "https://t.me/+495j5rWmApsxYzg9")
+    });
+
+    for (const adminId of ADMIN_IDS) {
+      const beijingTime = formatBeijingDateTime(getBeijingNowDate());
+      await bot.api.sendMessage(
+        adminId,
+        "💎 VIP订单提交\n\n" +
+          `用户：${ctx.from.first_name || ""}${ctx.from.username ? " @" + ctx.from.username : ""}\n` +
+          `ID：${ctx.from.id}\n` +
+          `时间：${beijingTime}\n` +
+          `订单：${digits}`
+      );
+    }
+
+    await createPendingReview({
+      userId: ctx.from.id,
+      username: ctx.from.username,
+      firstName: ctx.from.first_name,
+      reviewType: "vip_order",
+      fileId: null,
+      orderNumber: digits,
+      messageId: null
+    });
+
+    await clearUserState(ctx.from.id);
+    return;
+  }
+
+  /* /y：上传图片 */
+  if (currentState === "waiting_first_verify_photo") {
+    if (!ctx.message.photo || ctx.message.photo.length === 0) {
+      await ctx.reply("❌ 请上传图片完成首次验证。");
+      return;
+    }
+
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const today = formatBeijingDateOnly(getBeijingNowDate());
+
+    await updateUserFields(ctx.from.id, {
+      first_verify_passed: true,
+      first_verify_date: today,
+      first_verify_time: new Date()
+    });
+
+    await ctx.reply("✅ 首次验证完成！🎉");
+    await ctx.reply("🎁 正在为你返回兑换页…");
+    await showDhPage(ctx, 1);
+    await ctx.reply("💎 你也可以选择加入会员获得更稳定体验：", { reply_markup: buildVipEntryKeyboard() });
+
+    await sendAdminReviewTicketForPhoto("first_verify", ctx.from, photo.file_id);
+
+    await clearUserState(ctx.from.id);
+    return;
+  }
+
+  /* /yz：上传图片 */
+  if (currentState === "waiting_second_verify_photo") {
+    if (!ctx.message.photo || ctx.message.photo.length === 0) {
+      await ctx.reply("❌ 请上传图片完成二次认证。");
+      return;
+    }
+
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+
+    await updateUserFields(ctx.from.id, { second_verify_passed: true });
+
+    await ctx.reply("✅ 二次认证完成！🎉");
+    await ctx.reply("🎁 正在为你返回兑换页…");
+    await showDhPage(ctx, 1);
+
+    await sendAdminReviewTicketForPhoto("second_verify", ctx.from, photo.file_id);
+
+    await clearUserState(ctx.from.id);
+    return;
+  }
+});
 
 /* -------------------- noop -------------------- */
 
