@@ -1,1105 +1,1346 @@
-"use strict";
-
-/**
- * =========================================================
- * 顶部可修改配置（都放顶部）
- * =========================================================
- */
-
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const DATABASE_URL = process.env.DATABASE_URL;
-const ADMIN_ID = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : NaN;
-
-const TIMEZONE = "Asia/Shanghai";
-
-const DAILY_LIMIT = 10;
-const NEW_USER_FREE_TODAY = 3;
-const OLD_USER_FREE_DAILY = 2;
-const COOLDOWN_SEQUENCE_MINUTES = [5, 10, 20, 30, 40];
-
-const PAGE_SIZE = 10;
-const AUTO_DELETE_EXPIRE_MINUTES = 5;
-const USER_INACTIVE_DAYS = 7;
-
-const FILE_ID_PAYMENT =
-  "AgACAgUAAxkBAAIDd2mEHCq1fvS4dwIjba1YCTLObQonAAJtDWsbrPMhVNjJFj6MFYBoAQADAgADeQADOAQ";
-const FILE_ID_ORDER =
-  "AgACAgUAAxkBAAIdz2mO8C3H0bWB81kO_KwIr5Tw0rkUAAJTD2sbFyV5VFJNZyg1bcyEAQADAgADeQADOgQ";
-
-const VIP_GROUP_LINK = "https://t.me/+495j5rWmApsxYzg9";
-
-const START_TEXT =
-  "🎉 喜迎新春｜资源免费获取\n\n欢迎使用资源助手～\n请选择下方功能开始👇";
-
-const VIP_TEXT =
-  "🧧 喜迎新春（特价）\n\n💎 VIP会员特权说明：\n✅ 专属中转通道\n✅ 优先审核入群\n✅ 7×24小时客服支持\n✅ 定期福利活动\n\n请按提示完成付款与验证。";
-
-const ORDER_GUIDE_TEXT =
-  "请发送你的【订单号】进行验证（请不要发送截图）。\n\n【如何查看订单号】\n我的 → 账单 → 账单详情 → 更多/查看详情 → 订单号\n\n复制订单号后，直接发给我即可。";
-
-const ORDER_FAIL_1_TEXT = "❌ 未识别到有效订单号，请再发送一次（仅发送订单号文本即可）。";
-const ORDER_FAIL_2_TEXT =
-  "❌ 验证失败次数已达上限。\n\n请返回首页重新发起验证，或联系管理员协助。\n\n💎 加入会员无需等待｜🧧 新春特价限时开启\n机不可失，时不再来！";
-
-const DH_EMPTY_TEXT = "📭 暂无兑换内容\n\n请等待管理员上传内容后再查看。";
-
-const DH_MENU_TEXT =
-  "🎁 兑换\n\n请选择下方关键词获取内容👇\n（点击后每次只发送一小段，需要你手动继续发送，避免刷屏）";
-
-const ADMIN_TEXT = "🛠 管理员后台\n请选择功能：";
-
-const P_HOME_TEXT = "商品添加\n\n点击下方按钮开始上架。\n也可以删除已存在的关键词。";
-
-function buildCooldownText(remainingMilliseconds) {
-  const remaining = Math.max(0, remainingMilliseconds);
-  const totalSeconds = Math.ceil(remaining / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  const secondsText = String(seconds).padStart(2, "0");
-
-  return (
-    "⏳ 当前需要稍候再试\n" +
-    `距离下一次可用还需：**${minutes}分${secondsText}秒**\n\n` +
-    "💎 加入会员无需等待｜🧧 新春特价限时开启\n" +
-    "✨ 免等待｜⚡ 更稳定｜🔒 更私密\n" +
-    "机不可失，时不再来！期待你的加入～"
-  );
-}
-
-const DAILY_LIMIT_TEXT =
-  "🚫 今日次数已用完，请明日再试或加入会员。\n\n💎 加入会员无需等待｜🧧 新春特价限时开启\n机不可失，时不再来！";
-
-/**
- * =========================================================
- * 依赖与校验
- * =========================================================
- */
-
-const { Bot, InlineKeyboard, webhookCallback } = require("grammy");
+const { Bot, InlineKeyboard, Keyboard } = require("grammy");
 const { Pool } = require("pg");
 
-if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN environment variable.");
-if (!DATABASE_URL) throw new Error("Missing DATABASE_URL environment variable.");
-if (!Number.isFinite(ADMIN_ID)) throw new Error("Missing or invalid ADMIN_ID environment variable.");
-if (!(DATABASE_URL.startsWith("postgresql://") || DATABASE_URL.startsWith("postgres://"))) {
-  throw new Error("Invalid DATABASE_URL format. It must start with postgresql:// or postgres://");
+// --- 环境变量 ---
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((s) => Number(s));
+
+if (!BOT_TOKEN || !DATABASE_URL) {
+  throw new Error("BOT_TOKEN or DATABASE_URL not set");
 }
 
 const bot = new Bot(BOT_TOKEN);
+const pool = new Pool({ connectionString: DATABASE_URL });
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+// Asia/Shanghai 时间工具
+const { DateTime } = require("luxon");
+
+// 防止在 Vercel 上多实例重复 setWebhook
+let webhookSet = false;
+
+// --- 工具函数 ---
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(Number(userId));
+}
+
+// 获取北京时间与 date_key
+function nowInChina() {
+  return DateTime.now().setZone("Asia/Shanghai");
+}
+function getDateKey(dt = nowInChina()) {
+  return dt.toISODate(); // YYYY-MM-DD
+}
+
+// 记录/更新用户
+async function upsertUser(ctx) {
+  const from = ctx.from;
+  if (!from) return;
+  const userId = from.id;
+  const username = from.username || null;
+  const firstName = from.first_name || null;
+  const lastName = from.last_name || null;
+  const now = nowInChina();
+  const dateKey = getDateKey(now);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "SELECT * FROM users WHERE user_id = $1",
+      [userId]
+    );
+    if (rows.length === 0) {
+      await client.query(
+        `INSERT INTO users
+         (user_id, username, first_name, last_name, first_seen_at, last_seen_at,
+          first_seen_date_key, last_date_key, dh_daily_count, dh_cooldown_until, is_admin)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NULL,$9)`,
+        [
+          userId,
+          username,
+          firstName,
+          lastName,
+          now.toJSDate(),
+          now.toJSDate(),
+          dateKey,
+          dateKey,
+          isAdmin(userId),
+        ]
+      );
+    } else {
+      const user = rows[0];
+      let dhDailyCount = user.dh_daily_count || 0;
+      // 日切：如果 last_date_key != 今天，则重置 dh_daily_count & cooldown
+      if (!user.last_date_key || user.last_date_key.toISOString().slice(0, 10) !== dateKey) {
+        dhDailyCount = 0;
+      }
+      await client.query(
+        `UPDATE users
+         SET username=$2,
+             first_name=$3,
+             last_name=$4,
+             last_seen_at=$5,
+             last_date_key=$6,
+             dh_daily_count=$7,
+             dh_cooldown_until=CASE
+               WHEN last_date_key IS NULL OR last_date_key::date <> $6::date
+               THEN NULL
+               ELSE dh_cooldown_until
+             END
+         WHERE user_id=$1`,
+        [
+          userId,
+          username,
+          firstName,
+          lastName,
+          now.toJSDate(),
+          dateKey,
+          dhDailyCount,
+        ]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+  } finally {
+    client.release();
+  }
+}
+
+// 读取用户记录（带日切处理）
+async function getUser(userId) {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query("SELECT * FROM users WHERE user_id=$1", [userId]);
+    if (rows.length === 0) return null;
+
+    const user = rows[0];
+    const now = nowInChina();
+    const todayKey = getDateKey(now);
+
+    if (!user.last_date_key || user.last_date_key.toISOString().slice(0, 10) !== todayKey) {
+      // 日切：重置
+      await client.query(
+        `UPDATE users
+         SET dh_daily_count=0,
+             dh_cooldown_until=NULL,
+             last_date_key=$2
+         WHERE user_id=$1`,
+        [userId, todayKey]
+      );
+      user.dh_daily_count = 0;
+      user.dh_cooldown_until = null;
+    }
+    return user;
+  } finally {
+    client.release();
+  }
+}
+
+// 冷却描述
+function formatDuration(ms) {
+  const sec = Math.ceil(ms / 1000);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m <= 0) return `${s} 秒`;
+  return `${m} 分 ${s} 秒`;
+}
+
+// 发送分页列表的通用工具（工单、关键词等）
+function buildPageHeader(current, total) {
+  return `📄 ${current}/${total}`;
+}
+
+// --- 状态存储（简单内存 FSM，仅针对管理员个人） ---
+const adminState = new Map(); // key: adminId, value: { mode, data }
+
+// /c 取消管理员当前状态
+function cancelAdminState(adminId) {
+  adminState.delete(adminId);
+}
+
+// /cz：重置管理员 dh 次数与冷却
+async function resetAdminDh(adminId) {
+  const client = await pool.connect();
+  try {
+    const now = nowInChina();
+    const dateKey = getDateKey(now);
+    await client.query(
+      `UPDATE users
+       SET dh_daily_count=0,
+           dh_cooldown_until=NULL,
+           first_seen_date_key=$2,
+           last_date_key=$2
+       WHERE user_id=$1`,
+      [adminId, dateKey]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+// --- /start 首页 ---
+bot.command("start", async (ctx) => {
+  await upsertUser(ctx);
+  const text =
+    "🎉 喜迎马年新春 · 资源免费领取专区 🎉\n\n" +
+    "🧧 新春期间，精选资源限时免费开放，先到先得！\n" +
+    "📚 学习 · 影音 · 工具 · 素材，应有尽有～\n\n" +
+    "👇 请选择服务：";
+
+  const kb = new InlineKeyboard()
+    .text("💎 加入会员（新春特价）", "start_join_vip")
+    .row()
+    .text("🎁 兑换资源", "start_dh");
+
+  await ctx.reply(text, { reply_markup: kb });
 });
 
-/**
- * =========================================================
- * DB 初始化（新增辅助表，不动 products/pending_reviews/auto_delete）
- * =========================================================
- */
+// 处理 deep link：/start start=dh -> 直接进入兑换
+bot.on("message:text", async (ctx, next) => {
+  // 处理外部传入命令之前，先做用户入库
+  await upsertUser(ctx);
+  return next();
+});
 
-async function ensureTables() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bot_users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        first_seen_date TEXT,
-        last_seen_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
+bot.callbackQuery("start_dh", async (ctx) => {
+  await handleDhEntry(ctx);
+});
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS dh_quota (
-        user_id BIGINT PRIMARY KEY,
-        date_key TEXT NOT NULL,
-        used_count INTEGER NOT NULL DEFAULT 0,
-        next_allowed_at TIMESTAMPTZ,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+// /dh 命令入口
+bot.command("dh", async (ctx) => {
+  await handleDhEntry(ctx);
+});
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bot_state (
-        user_id BIGINT PRIMARY KEY,
-        state_key TEXT,
-        state_value TEXT,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+async function handleDhEntry(ctx) {
+  const userId = ctx.from.id;
+  const user = await getUser(userId);
+  const now = nowInChina();
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS p_buffer (
-        id BIGSERIAL PRIMARY KEY,
-        admin_id BIGINT NOT NULL,
-        keyword TEXT NOT NULL,
-        content_type TEXT NOT NULL,
-        content_data TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-  } finally {
-    client.release();
-  }
-}
+  // 免费次数规则：
+  // 新用户：first_seen_date_key=今天 -> 当天免费3次
+  // 老用户：每天免费2次
+  const dateKey = getDateKey(now);
+  const isNewUser =
+    user && user.first_seen_date_key && user.first_seen_date_key.toISOString().slice(0, 10) === dateKey;
 
-/**
- * =========================================================
- * 时间工具（北京时间）
- * =========================================================
- */
+  const freeLimit = isNewUser ? 3 : 2;
+  const maxDaily = 10;
 
-function getDateKeyInTimezone(date, timeZone) {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  });
-  return formatter.format(date);
-}
+  // 冷却检查
+  if (user.dh_cooldown_until && now.toJSDate() < user.dh_cooldown_until) {
+    const diff = user.dh_cooldown_until.getTime() - now.toMillis();
+    const text =
+      "⏳ 当前处于冷却期，请稍后再试。\n\n" +
+      `预计剩余时间：${formatDuration(diff)}\n\n` +
+      "如需立即解锁更多次数，可考虑升级会员～";
 
-function formatBeijingDateTime(date) {
-  const formatter = new Intl.DateTimeFormat("zh-CN", {
-    timeZone: TIMEZONE,
-    year: "numeric",
-    month: "long",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  });
-  return formatter.format(date);
-}
-
-/**
- * =========================================================
- * auto_delete：触发式5分钟删除（先检查后处理）
- * =========================================================
- */
-
-async function registerAutoDelete(chatId, messageId) {
-  const client = await pool.connect();
-  try {
-    const deleteAt = new Date(Date.now() + AUTO_DELETE_EXPIRE_MINUTES * 60 * 1000);
-    await client.query(
-      `INSERT INTO auto_delete (chat_id, message_id, delete_at) VALUES ($1, $2, $3);`,
-      [Number(chatId), Number(messageId), deleteAt]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-async function gcExpiredMessages(ctx) {
-  if (!ctx.chat || !ctx.chat.id) return;
-
-  const chatId = Number(ctx.chat.id);
-  const now = new Date();
-
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `
-      SELECT id, message_id
-      FROM auto_delete
-      WHERE chat_id = $1
-        AND delete_at IS NOT NULL
-        AND delete_at <= $2
-      ORDER BY delete_at ASC
-      LIMIT 500;
-      `,
-      [chatId, now]
-    );
-
-    for (const row of res.rows) {
-      try {
-        await ctx.api.deleteMessage(chatId, Number(row.message_id));
-      } catch (error) {}
-      try {
-        await client.query(`DELETE FROM auto_delete WHERE id = $1;`, [row.id]);
-      } catch (error) {}
-    }
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * =========================================================
- * state
- * =========================================================
- */
-
-async function setUserState(userId, key, value) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `
-      INSERT INTO bot_state (user_id, state_key, state_value, updated_at)
-      VALUES ($1, $2, $3, NOW())
-      ON CONFLICT (user_id)
-      DO UPDATE SET state_key = EXCLUDED.state_key, state_value = EXCLUDED.state_value, updated_at = NOW();
-      `,
-      [Number(userId), String(key), String(value)]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-async function getUserState(userId) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `SELECT state_key, state_value FROM bot_state WHERE user_id = $1;`,
-      [Number(userId)]
-    );
-    if (!res.rows.length) return { key: null, value: null };
-    return { key: res.rows[0].state_key, value: res.rows[0].state_value };
-  } finally {
-    client.release();
-  }
-}
-
-async function clearUserState(userId) {
-  const client = await pool.connect();
-  try {
-    await client.query(`DELETE FROM bot_state WHERE user_id = $1;`, [Number(userId)]);
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * =========================================================
- * 用户记录与停用
- * =========================================================
- */
-
-async function upsertBotUser(user) {
-  const userId = Number(user.id);
-  const username = user.username ? String(user.username) : null;
-  const firstName = user.first_name ? String(user.first_name) : (user.firstName ? String(user.firstName) : null);
-  const lastName = user.last_name ? String(user.last_name) : (user.lastName ? String(user.lastName) : null);
-  const todayKey = getDateKeyInTimezone(new Date(), TIMEZONE);
-
-  const client = await pool.connect();
-  try {
-    const existing = await client.query(`SELECT first_seen_date FROM bot_users WHERE user_id = $1;`, [userId]);
-
-    if (!existing.rows.length) {
-      await client.query(
-        `
-        INSERT INTO bot_users (user_id, username, first_name, last_name, first_seen_date, last_seen_at)
-        VALUES ($1, $2, $3, $4, $5, NOW());
-        `,
-        [userId, username, firstName, lastName, todayKey]
-      );
-      return { isFirstDay: true, isFirstSeenEver: true, firstSeenDate: todayKey };
-    }
-
-    await client.query(
-      `
-      UPDATE bot_users
-      SET username = $2, first_name = $3, last_name = $4, last_seen_at = NOW()
-      WHERE user_id = $1;
-      `,
-      [userId, username, firstName, lastName]
-    );
-
-    const firstSeenDate = existing.rows[0].first_seen_date;
-    return { isFirstDay: firstSeenDate === todayKey, isFirstSeenEver: false, firstSeenDate };
-  } finally {
-    client.release();
-  }
-}
-
-async function getInactiveStatusText(userId) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(`SELECT last_seen_at FROM bot_users WHERE user_id = $1 LIMIT 1;`, [Number(userId)]);
-    if (!res.rows.length || !res.rows[0].last_seen_at) return "用户状态：未知";
-
-    const lastSeen = new Date(res.rows[0].last_seen_at);
-    const inactiveMs = USER_INACTIVE_DAYS * 24 * 60 * 60 * 1000;
-    const inactive = Date.now() - lastSeen.getTime() >= inactiveMs;
-    if (inactive) return `用户停用：${formatBeijingDateTime(lastSeen)}`;
-    return "用户状态：活跃";
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * =========================================================
- * admin auth
- * =========================================================
- */
-
-function isAdmin(ctx) {
-  return Boolean(ctx.from && Number(ctx.from.id) === Number(ADMIN_ID));
-}
-
-async function requireAdmin(ctx) {
-  if (!isAdmin(ctx)) {
-    const sent = await ctx.reply("⛔ 无权限访问");
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return false;
-  }
-  return true;
-}
-
-/**
- * =========================================================
- * 工单 pending_reviews
- * =========================================================
- */
-
-async function insertTicketRow(row) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `
-      INSERT INTO pending_reviews (user_id, username, first_name, review_type, file_id, order_number, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7);
-      `,
-      [
-        Number(row.user_id),
-        row.username,
-        row.first_name,
-        row.review_type,
-        row.file_id,
-        row.order_number,
-        row.status
-      ]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * =========================================================
- * products：关键词与内容
- * =========================================================
- */
-
-async function listKeywordsOldestFirst() {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `
-      SELECT keyword, MIN(id) AS first_id
-      FROM products
-      GROUP BY keyword
-      ORDER BY first_id ASC;
-      `
-    );
-    return res.rows.map((r) => String(r.keyword));
-  } finally {
-    client.release();
-  }
-}
-
-async function listProductsByKeywordOldestFirst(keyword) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `
-      SELECT id, keyword, content_type, content_data, created_at
-      FROM products
-      WHERE keyword = $1
-      ORDER BY id ASC;
-      `,
-      [String(keyword)]
-    );
-    return res.rows;
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * =========================================================
- * /dh 频控
- * =========================================================
- */
-
-function getCooldownMinutesByIndex(index) {
-  if (index < 0) return 0;
-  if (index < COOLDOWN_SEQUENCE_MINUTES.length) return COOLDOWN_SEQUENCE_MINUTES[index];
-  const last = COOLDOWN_SEQUENCE_MINUTES[COOLDOWN_SEQUENCE_MINUTES.length - 1];
-  return last + (index - (COOLDOWN_SEQUENCE_MINUTES.length - 1)) * last;
-}
-
-async function getOrInitQuota(userId, todayKey) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `SELECT date_key, used_count, next_allowed_at FROM dh_quota WHERE user_id = $1;`,
-      [Number(userId)]
-    );
-
-    if (!res.rows.length) {
-      await client.query(
-        `INSERT INTO dh_quota (user_id, date_key, used_count, next_allowed_at, updated_at)
-         VALUES ($1, $2, 0, NULL, NOW());`,
-        [Number(userId), todayKey]
-      );
-      return { usedCount: 0, nextAllowedAt: null, dateKey: todayKey };
-    }
-
-    const row = res.rows[0];
-    if (row.date_key !== todayKey) {
-      await client.query(
-        `UPDATE dh_quota
-         SET date_key = $2, used_count = 0, next_allowed_at = NULL, updated_at = NOW()
-         WHERE user_id = $1;`,
-        [Number(userId), todayKey]
-      );
-      return { usedCount: 0, nextAllowedAt: null, dateKey: todayKey };
-    }
-
-    return {
-      usedCount: Number(row.used_count || 0),
-      nextAllowedAt: row.next_allowed_at ? new Date(row.next_allowed_at) : null,
-      dateKey: row.date_key
-    };
-  } finally {
-    client.release();
-  }
-}
-
-async function updateQuotaAfterSuccess(userId, todayKey, usedCount, nextAllowedAt) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `UPDATE dh_quota
-       SET date_key = $2, used_count = $3, next_allowed_at = $4, updated_at = NOW()
-       WHERE user_id = $1;`,
-      [Number(userId), todayKey, Number(usedCount), nextAllowedAt]
-    );
-  } finally {
-    client.release();
-  }
-}
-
-async function dhCheckAndConsumeQuota(ctx) {
-  const todayKey = getDateKeyInTimezone(new Date(), TIMEZONE);
-  const userInfo = await upsertBotUser(ctx.from);
-  const quota = await getOrInitQuota(ctx.from.id, todayKey);
-
-  if (quota.usedCount >= DAILY_LIMIT) return { allowed: false, reason: "limit" };
-  if (quota.nextAllowedAt && quota.nextAllowedAt.getTime() > Date.now()) {
-    return { allowed: false, reason: "cooldown", nextAllowedAt: quota.nextAllowedAt };
-  }
-
-  const newUsedCount = quota.usedCount + 1;
-  const freeCount = userInfo.isFirstDay ? NEW_USER_FREE_TODAY : OLD_USER_FREE_DAILY;
-
-  let nextAllowedAt = null;
-  if (newUsedCount >= freeCount) {
-    const afterFreeIndex = newUsedCount - freeCount;
-    const minutes = getCooldownMinutesByIndex(afterFreeIndex);
-    nextAllowedAt = new Date(Date.now() + minutes * 60 * 1000);
-  }
-
-  await updateQuotaAfterSuccess(ctx.from.id, todayKey, newUsedCount, nextAllowedAt);
-  return { allowed: true };
-}
-
-async function sendDhBlocked(ctx, blockInfo) {
-  const keyboard = new InlineKeyboard()
-    .text("💎 加入会员（新春特价）", "go_v")
-    .row()
-    .text("🏠 返回首页", "go_start");
-
-  if (blockInfo.reason === "limit") {
-    const sent = await ctx.reply(DAILY_LIMIT_TEXT, { reply_markup: keyboard });
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-  if (blockInfo.reason === "cooldown") {
-    const remainingMs = blockInfo.nextAllowedAt.getTime() - Date.now();
-    const sent = await ctx.reply(buildCooldownText(remainingMs), { reply_markup: keyboard, parse_mode: "Markdown" });
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-}
-
-/**
- * =========================================================
- * /dh 菜单与“继续发送”
- * 关键修复：点击关键词后只发“提示+1条内容”，再出现继续按钮，避免刷屏
- * =========================================================
- */
-
-async function showDhMenu(ctx, pageIndex) {
-  const keywords = await listKeywordsOldestFirst();
-  if (!keywords.length) {
-    const keyboard = new InlineKeyboard()
-      .text("💎 加入会员（新春特价）", "go_v")
+    const kb = new InlineKeyboard()
+      .text("💎 加入会员（新春特价）", "start_join_vip")
       .row()
-      .text("🏠 返回首页", "go_start");
-    const sent = await ctx.reply(DH_EMPTY_TEXT, { reply_markup: keyboard });
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+      .text("↩️ 返回兑换", "start_dh");
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+    } else {
+      await ctx.reply(text, { reply_markup: kb });
+    }
     return;
   }
 
-  const total = keywords.length;
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const safePageIndex = Math.min(Math.max(pageIndex, 0), pageCount - 1);
-  const start = safePageIndex * PAGE_SIZE;
-  const pageItems = keywords.slice(start, start + PAGE_SIZE);
+  // 日次数限制
+  if (user.dh_daily_count >= maxDaily) {
+    const text =
+      "📈 今日兑换次数已达到上限。\n\n" +
+      "🔄 请明天再来，或升级会员解锁更多权益。";
 
-  const text = `📄 ${safePageIndex + 1}/${pageCount}\n\n${DH_MENU_TEXT}`;
-  const keyboard = new InlineKeyboard();
-
-  for (const kw of pageItems) {
-    keyboard.text(String(kw), `dh_kw:${encodeURIComponent(String(kw))}`).row();
-  }
-
-  if (safePageIndex > 0) keyboard.text("◀️ 上一页", `dh_page:${safePageIndex - 1}`);
-  if (safePageIndex < pageCount - 1) keyboard.text("▶️ 下一页", `dh_page:${safePageIndex + 1}`);
-
-  keyboard.row().text("💎 加入会员（新春特价）", "go_v");
-  keyboard.row().text("🏠 返回首页", "go_start");
-
-  const sent = await ctx.reply(text, { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
-
-/**
- * 发送内容：逻辑上仍是“10条记录一组”，但每次只发 1 条 record，然后给继续按钮。
- * offset 表示当前在 keyword 的 records 中的下标（0..n-1）
- */
-async function dhSendNext(ctx, keyword, offset) {
-  const rows = await listProductsByKeywordOldestFirst(keyword);
-  if (!rows.length) {
-    const sent = await ctx.reply("该关键词暂无内容，请等待管理员上传。");
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-
-  const totalRecords = rows.length;
-  const safeOffset = Math.min(Math.max(offset, 0), totalRecords);
-
-  if (safeOffset >= totalRecords) {
-    const keyboard = new InlineKeyboard()
-      .text("💎 加入会员（新春特价）", "go_v")
+    const kb = new InlineKeyboard()
+      .text("💎 加入会员（新春特价）", "start_join_vip")
       .row()
-      .text("↩️ 返回兑换", "go_dh");
-    const sent = await ctx.reply("✅ 文件发送完毕（全部组已完成）。", { reply_markup: keyboard });
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+      .text("↩️ 返回首页", "back_to_start");
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+    } else {
+      await ctx.reply(text, { reply_markup: kb });
+    }
     return;
   }
 
-  const groupIndex = Math.floor(safeOffset / 10) + 1;
-  const groupCount = Math.ceil(totalRecords / 10);
-  const inGroupIndex = (safeOffset % 10) + 1;
-
-  const tip = await ctx.reply(`📦 文件 ${groupIndex}/${groupCount} · 条目 ${inGroupIndex}/10`);
-  if (tip && tip.message_id) await registerAutoDelete(ctx.chat.id, tip.message_id);
-
-  // 只发送一条 record（避免刷屏）
-  const row = rows[safeOffset];
-  await sendProductRow(ctx, row);
-
-  const nextOffset = safeOffset + 1;
-  const finished = nextOffset >= totalRecords;
-
-  if (finished) {
-    const keyboard = new InlineKeyboard()
-      .text("💎 加入会员（新春特价）", "go_v")
-      .row()
-      .text("↩️ 返回兑换", "go_dh");
-    const sent = await ctx.reply("✅ 文件发送完毕（全部组已完成）。", { reply_markup: keyboard });
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-
-  const keyboard = new InlineKeyboard()
-    .text("✨👉 请点击继续发送", `dh_more:${encodeURIComponent(keyword)}:${nextOffset}`)
-    .row()
-    .text("💎 加入会员（新春特价）", "go_v")
-    .row()
-    .text("↩️ 返回兑换", "go_dh");
-
-  const sent = await ctx.reply("已发送一条内容，点击继续发送下一条👇", { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+  // 拉取 keywords 列表，分页显示 10 条/页
+  const page = 1;
+  await showDhKeywordsPage(ctx, page);
 }
 
-/**
- * =========================================================
- * 发送 products 的一条记录
- * =========================================================
- */
-
-function normalizeMediaType(type) {
-  const t = String(type || "").toLowerCase();
-  if (t === "photo") return "photo";
-  if (t === "video") return "video";
-  if (t === "audio") return "audio";
-  return "document";
-}
-
-async function sendMediaGroupSafely(ctx, mediaArray) {
+// 展示 /dh 关键字分页
+async function showDhKeywordsPage(ctx, page) {
+  const perPage = 10;
+  const client = await pool.connect();
   try {
-    const messages = await ctx.api.sendMediaGroup(ctx.chat.id, mediaArray);
-    if (Array.isArray(messages)) {
-      for (const msg of messages) {
-        if (msg && msg.message_id) await registerAutoDelete(ctx.chat.id, msg.message_id);
+    const { rows: countRows } = await client.query("SELECT COUNT(*)::int AS c FROM keywords");
+    const total = countRows[0].c;
+    if (total === 0) {
+      const text =
+        "🎁 当前暂无可兑换资源\n\n" +
+        "请耐心等待管理员上架～";
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(text).catch(() => {});
+      } else {
+        await ctx.reply(text);
       }
+      return;
     }
-    return true;
-  } catch (error) {
-    return false;
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const current = Math.min(Math.max(page, 1), totalPages);
+
+    const offset = (current - 1) * perPage;
+    const { rows } = await client.query(
+      `SELECT id, keyword
+       FROM keywords
+       ORDER BY created_at ASC
+       LIMIT $1 OFFSET $2`,
+      [perPage, offset]
+    );
+
+    let text = `${buildPageHeader(current, totalPages)}\n\n请选择要兑换的关键词：`;
+    const kb = new InlineKeyboard();
+    for (const r of rows) {
+      kb.text(r.keyword, `dh_kw_${r.id}`).row();
+    }
+    // 分页按钮
+    if (totalPages > 1) {
+      if (current > 1) kb.text("⬅️ 上一页", `dh_page_${current - 1}`);
+      if (current < totalPages) kb.text("➡️ 下一页", `dh_page_${current + 1}`);
+      kb.row();
+    }
+    kb.text("↩️ 返回首页", "back_to_start");
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+        await ctx.answerCallbackQuery();
+      });
+    } else {
+      await ctx.reply(text, { reply_markup: kb });
+    }
+  } finally {
+    client.release();
   }
 }
 
-async function sendProductRow(ctx, row) {
-  if (!row) return;
+// /dh 翻页
+bot.callbackQuery(/dh_page_(\d+)/, async (ctx) => {
+  const page = Number(ctx.match[1]);
+  await showDhKeywordsPage(ctx, page);
+});
 
-  if (row.content_type === "text") {
-    const sent = await ctx.reply(String(row.content_data || ""));
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+// /dh 点击具体关键词 -> 发送内容（每组10条）
+bot.callbackQuery(/dh_kw_(\d+)/, async (ctx) => {
+  const keywordId = Number(ctx.match[1]);
+  const userId = ctx.from.id;
+  const now = nowInChina();
+  const user = await getUser(userId);
+
+  // 检查冷却 & 次数（与入口一致）
+  const dateKey = getDateKey(now);
+  const isNewUser =
+    user &&
+    user.first_seen_date_key &&
+    user.first_seen_date_key.toISOString().slice(0, 10) === dateKey;
+  const freeLimit = isNewUser ? 3 : 2;
+
+  // 使用次数 + 更新冷却序列
+  const currentCount = user.dh_daily_count || 0;
+
+  let newCount = currentCount + 1;
+  let cooldownMs = 0;
+  if (currentCount >= freeLimit) {
+    // 已经消耗完免费次数，走冷却序列
+    // 冷却序列: 5,10,30,40,50（分钟）
+    const seq = [5, 10, 30, 40, 50];
+    const index = Math.min(currentCount - freeLimit, seq.length - 1); // 0-based
+    cooldownMs = seq[index] * 60 * 1000;
+  }
+
+  if (newCount > 10) {
+    await ctx.answerCallbackQuery("今日次数已达上限，请明日再试", { show_alert: true });
     return;
   }
 
-  if (row.content_type === "media_group") {
-    let arr = [];
-    try {
-      const parsed = JSON.parse(row.content_data);
-      if (Array.isArray(parsed)) arr = parsed;
-    } catch (error) {
-      arr = [];
-    }
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE users
+       SET dh_daily_count=$2,
+           dh_cooldown_until=CASE WHEN $3 > 0 THEN (NOW() AT TIME ZONE 'Asia/Shanghai' + ($3 || ' milliseconds')::interval)
+                                  ELSE NULL
+                             END
+       WHERE user_id=$1`,
+      [userId, newCount, cooldownMs]
+    );
+  } finally {
+    client.release();
+  }
 
-    if (!arr.length) {
-      const sent = await ctx.reply("该内容格式异常，无法发送。");
-      if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+  // 发送内容
+  await sendKeywordContentsInBatches(ctx, keywordId);
+});
+
+// 发送关键词内容（每10条为一组）
+async function sendKeywordContentsInBatches(ctx, keywordId) {
+  const client = await pool.connect();
+  try {
+    const { rows: kwRows } = await client.query(
+      "SELECT keyword FROM keywords WHERE id=$1",
+      [keywordId]
+    );
+    if (kwRows.length === 0) {
+      await ctx.answerCallbackQuery("该资源已下架", { show_alert: true });
       return;
     }
 
-    // 只发前10个媒体（防刷屏）。剩余媒体你如果需要可做“媒体继续发送”，这里先保持最稳不刷。
-    const chunk = arr.slice(0, 10);
-    const media = chunk.map((m) => {
-      const type = normalizeMediaType(m.type);
-      const fileId = String(m.data);
-      if (type === "photo") return { type: "photo", media: fileId };
-      if (type === "video") return { type: "video", media: fileId };
-      if (type === "audio") return { type: "audio", media: fileId };
-      return { type: "document", media: fileId };
-    });
-
-    const ok = await sendMediaGroupSafely(ctx, media);
-    if (!ok) {
-      for (const m of chunk) {
-        const type = normalizeMediaType(m.type);
-        const fileId = String(m.data);
-        try {
-          let sent = null;
-          if (type === "photo") sent = await ctx.replyWithPhoto(fileId);
-          else if (type === "video") sent = await ctx.replyWithVideo(fileId);
-          else sent = await ctx.replyWithDocument(fileId);
-          if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-        } catch (e) {}
-      }
-    }
-    return;
-  }
-
-  const sent = await ctx.reply(String(row.content_data || ""));
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
-
-/**
- * =========================================================
- * /v 校验：内部 20260\d+（文案不提示）
- * =========================================================
- */
-
-function extractOrderNumber20260(text) {
-  const match = String(text || "").match(/\b20260\d+\b/);
-  return match ? match[0] : null;
-}
-
-async function handleVipOrderInput(ctx) {
-  const st = await getUserState(ctx.from.id);
-  const failCount = Number(st.value || "0");
-
-  const orderNumber = extractOrderNumber20260(String(ctx.message.text || "").trim());
-
-  if (!orderNumber) {
-    const newFail = failCount + 1;
-    if (newFail >= 2) {
-      await clearUserState(ctx.from.id);
-      await ctx.reply(ORDER_FAIL_2_TEXT);
-      await showStart(ctx);
+    const { rows } = await client.query(
+      `SELECT id, content_type, payload
+       FROM keyword_contents
+       WHERE keyword_id=$1
+       ORDER BY created_at ASC`,
+      [keywordId]
+    );
+    if (rows.length === 0) {
+      await ctx.answerCallbackQuery("该资源暂时没有内容", { show_alert: true });
       return;
     }
-    await setUserState(ctx.from.id, "v_wait_order", String(newFail));
-    await ctx.reply(ORDER_FAIL_1_TEXT);
-    return;
+
+    const total = rows.length;
+    const batchSize = 10;
+    let batchStart = 0;
+    let batchIndex = 1;
+
+    while (batchStart < total) {
+      const batch = rows.slice(batchStart, batchStart + batchSize);
+      const groupCount = Math.min(batchSize, total - batchStart);
+
+      let fileIndex = 1;
+      for (const item of batch) {
+        const payload = item.payload;
+        const type = item.content_type;
+
+        // 为每条内容加一个“📦 文件 i/x”的进度提示
+        const progressText = `📦 文件 ${fileIndex}/${groupCount}`;
+        fileIndex++;
+
+        // 先发文件，再发进度提示（也可以合并文本）
+        switch (type) {
+          case "text":
+            await ctx.api.sendMessage(ctx.chat.id, payload.text);
+            break;
+          case "photo":
+            await ctx.api.sendPhoto(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          case "document":
+            await ctx.api.sendDocument(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          case "video":
+            await ctx.api.sendVideo(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          default:
+            await ctx.api.sendMessage(
+              ctx.chat.id,
+              `收到一种不支持的内容类型：${type}`
+            );
+        }
+
+        await ctx.api.sendMessage(ctx.chat.id, progressText);
+      }
+
+      batchStart += batchSize;
+      if (batchStart < total) {
+        // 还有下一组
+        const kb = new InlineKeyboard()
+          .text("✨👉 继续发送", `dh_send_next_${keywordId}_${batchStart}`)
+          .row()
+          .text("💎 加入会员（新春特价）", "start_join_vip")
+          .row()
+          .text("↩️ 返回兑换", "start_dh");
+        await ctx.reply(
+          `本组文件发送完毕（第 ${batchIndex} 组）`,
+          { reply_markup: kb }
+        );
+        break; // 交给 callback 再继续
+      } else {
+        // 全部发送完成
+        const kb = new InlineKeyboard()
+          .text("💎 加入会员（新春特价）", "start_join_vip")
+          .row()
+          .text("↩️ 返回兑换", "start_dh");
+        await ctx.reply("✅ 文件发送完毕（全部组已完成）。", {
+          reply_markup: kb,
+        });
+      }
+      batchIndex++;
+    }
+  } finally {
+    client.release();
   }
+}
 
-  const statusText = await getInactiveStatusText(ctx.from.id);
+// 继续发送下一组
+bot.callbackQuery(/dh_send_next_(\d+)_(\d+)/, async (ctx) => {
+  const keywordId = Number(ctx.match[1]);
+  const startIndex = Number(ctx.match[2]);
 
-  // 写 vip 工单
+  // 重新拉取内容，从 startIndex 开始
+  const client = await pool.connect();
   try {
-    await insertTicketRow({
-      user_id: ctx.from.id,
-      username: ctx.from.username ? String(ctx.from.username) : null,
-      first_name: ctx.from.first_name ? String(ctx.from.first_name) : null,
-      review_type: "vip",
-      file_id: null,
-      order_number: orderNumber,
-      status: statusText
-    });
-  } catch (error) {}
+    const { rows } = await client.query(
+      `SELECT id, content_type, payload
+       FROM keyword_contents
+       WHERE keyword_id=$1
+       ORDER BY created_at ASC`,
+      [keywordId]
+    );
+    const total = rows.length;
+    const batchSize = 10;
+    let batchStart = startIndex;
+    let batchIndex = Math.floor(startIndex / batchSize) + 1;
 
-  // 私发管理员（北京时间）
-  try {
-    const msg =
-      "📮 工单通知\n\n" +
-      `类型：VIP验证成功\n` +
-      `用户：${ctx.from.first_name || "无"}（@${ctx.from.username || "无"}）\n` +
-      `用户ID：${ctx.from.id}\n` +
-      `订单号：${orderNumber}\n` +
-      `${statusText}\n` +
-      `时间（北京时间）：${formatBeijingDateTime(new Date())}`;
-    await ctx.api.sendMessage(ADMIN_ID, msg);
-  } catch (error) {}
+    if (batchStart >= total) {
+      await ctx.answerCallbackQuery("没有更多内容了", { show_alert: true });
+      return;
+    }
 
-  await clearUserState(ctx.from.id);
+    while (batchStart < total) {
+      const batch = rows.slice(batchStart, batchStart + batchSize);
+      const groupCount = Math.min(batchSize, total - batchStart);
+      let fileIndex = 1;
+      for (const item of batch) {
+        const payload = item.payload;
+        const type = item.content_type;
+        const progressText = `📦 文件 ${fileIndex}/${groupCount}`;
+        fileIndex++;
 
-  const keyboard = new InlineKeyboard()
-    .url("✅ 加入会员群", VIP_GROUP_LINK)
-    .row()
-    .text("🎁 去兑换", "go_dh")
-    .row()
-    .text("🏠 返回首页", "go_start");
+        switch (type) {
+          case "text":
+            await ctx.api.sendMessage(ctx.chat.id, payload.text);
+            break;
+          case "photo":
+            await ctx.api.sendPhoto(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          case "document":
+            await ctx.api.sendDocument(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          case "video":
+            await ctx.api.sendVideo(ctx.chat.id, payload.file_id, {
+              caption: payload.caption || undefined,
+            });
+            break;
+          default:
+            await ctx.api.sendMessage(
+              ctx.chat.id,
+              `收到一种不支持的内容类型：${type}`
+            );
+        }
 
-  const sent = await ctx.reply("✅ 验证通过，欢迎加入会员！\n点击下方按钮进群：", { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
+        await ctx.api.sendMessage(ctx.chat.id, progressText);
+      }
 
-/**
- * =========================================================
- * File ID 获取
- * =========================================================
- */
-
-function extractFirstFileIdFromMessage(message) {
-  if (!message) return null;
-  if (message.photo && Array.isArray(message.photo) && message.photo.length > 0) return message.photo[message.photo.length - 1].file_id;
-  if (message.video) return message.video.file_id;
-  if (message.document) return message.document.file_id;
-  if (message.audio) return message.audio.file_id;
-  return null;
-}
-
-/**
- * =========================================================
- * /p 商品添加：提取存储内容
- * =========================================================
- */
-
-function tryExtractContentForStorage(message) {
-  if (!message) return null;
-
-  if (typeof message.text === "string" && message.text.trim().length > 0) {
-    return { contentType: "text", contentData: message.text.trim() };
+      batchStart += batchSize;
+      if (batchStart < total) {
+        const kb = new InlineKeyboard()
+          .text("✨👉 继续发送", `dh_send_next_${keywordId}_${batchStart}`)
+          .row()
+          .text("💎 加入会员（新春特价）", "start_join_vip")
+          .row()
+          .text("↩️ 返回兑换", "start_dh");
+        await ctx.reply(
+          `本组文件发送完毕（第 ${batchIndex} 组）`,
+          { reply_markup: kb }
+        );
+        break;
+      } else {
+        const kb = new InlineKeyboard()
+          .text("💎 加入会员（新春特价）", "start_join_vip")
+          .row()
+          .text("↩️ 返回兑换", "start_dh");
+        await ctx.reply("✅ 文件发送完毕（全部组已完成）。", {
+          reply_markup: kb,
+        });
+      }
+      batchIndex++;
+    }
+  } finally {
+    client.release();
   }
+});
 
-  const fileId = extractFirstFileIdFromMessage(message);
-  if (fileId) {
-    let type = "document";
-    if (message.photo) type = "photo";
-    else if (message.video) type = "video";
-    else if (message.audio) type = "audio";
-    else if (message.document) type = "document";
+// 返回首页
+bot.callbackQuery("back_to_start", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await bot.api.sendMessage(
+    ctx.chat.id,
+    "已返回首页，请重新选择服务。",
+    {
+      reply_markup: new InlineKeyboard()
+        .text("💎 加入会员（新春特价）", "start_join_vip")
+        .row()
+        .text("🎁 兑换资源", "start_dh"),
+    }
+  );
+});
 
-    const contentData = JSON.stringify([{ type, data: fileId }]);
-    return { contentType: "media_group", contentData };
-  }
-
-  return null;
-}
-
-/**
- * =========================================================
- * 核心：保证所有命令可用（命令注册）
- * =========================================================
- */
-
-bot.command("start", async (ctx) => {
-  const text = ctx.message && ctx.message.text ? String(ctx.message.text) : "";
-  const parts = text.split(" ").map((p) => p.trim()).filter(Boolean);
-  if (parts.length >= 2 && parts[1] === "dh") {
-    // deep link
-    await showDh(ctx);
-    return;
-  }
-  await showStart(ctx);
+// --- 加入会员逻辑 /v ---
+// 点击“加入会员（新春特价）” -> /v 页面
+bot.callbackQuery("start_join_vip", async (ctx) => {
+  await showVipPage(ctx);
 });
 
 bot.command("v", async (ctx) => {
-  await showVip(ctx);
+  await showVipPage(ctx);
 });
 
-bot.command("dh", async (ctx) => {
-  await showDh(ctx);
+async function showVipPage(ctx) {
+  const text =
+    "🎉 喜迎新春（特价 VIP 专区）\n\n" +
+    "💎 VIP会员特权说明：\n" +
+    "✅ 专属中转通道\n" +
+    "✅ 优先审核入群\n" +
+    "✅ 7x24 小时客服支持\n" +
+    "✅ 定期福利活动\n\n" +
+    "请先完成付款，然后点击下方按钮提交订单号进行验证。\n\n" +
+    "（此处插入宣传图等 file_id 消息）";
+
+  const kb = new InlineKeyboard().text("✅ 我已付款，开始验证", "vip_paid");
+  if (ctx.callbackQuery) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+      await ctx.reply(text, { reply_markup: kb });
+    });
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+// 点击“我已付款，开始验证” -> 让用户输入订单号
+bot.callbackQuery("vip_paid", async (ctx) => {
+  const userId = ctx.from.id;
+  adminState.set(userId, { mode: "waiting_order_no", data: { retry: 0 } });
+
+  const text =
+    "📄 订单验证流程说明：\n\n" +
+    "1. 打开你的支付平台/账单页面\n" +
+    "2. 找到本次付款记录\n" +
+    "3. 进入【账单详情】或【订单详情】\n" +
+    "4. 在页面中找到【订单号】字段\n" +
+    "5. 复制完整订单号并粘贴发送到本聊天\n\n" +
+    "请在此输入你的订单号：";
+
+  await ctx.editMessageText(text).catch(async () => {
+    await ctx.reply(text);
+  });
 });
 
-bot.command("admin", async (ctx) => {
-  await showAdmin(ctx);
-});
+// 处理订单号输入（仅限当前用户处于 waiting_order_no 状态）
+bot.on("message:text", async (ctx, next) => {
+  const userId = ctx.from.id;
+  const st = adminState.get(userId);
+  if (!st || st.mode !== "waiting_order_no") {
+    return next();
+  }
 
-bot.command("p", async (ctx) => {
-  await showP(ctx);
-});
+  const orderNo = ctx.message.text.trim();
+  // 内部逻辑：识别以 20260 开头的订单号。不对用户提示任何“规则信息”。
+  const isMatch = /^20260.+/.test(orderNo);
 
-bot.command("c", async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
-  await clearUserState(ctx.from.id);
-  await ctx.reply("✅ 已取消你当前的验证/上架等待状态。");
-});
+  if (!isMatch) {
+    st.data.retry = (st.data.retry || 0) + 1;
+    adminState.set(userId, st);
 
-bot.command("cz", async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
+    if (st.data.retry >= 2) {
+      // 连续两次失败 -> 回到 /start
+      adminState.delete(userId);
+      const text =
+        "订单号识别失败。\n\n" +
+        "你可以返回首页重新选择服务：";
+      const kb = new InlineKeyboard()
+        .text("🏠 返回首页", "back_to_start");
+      await ctx.reply(text, { reply_markup: kb });
+      return;
+    } else {
+      await ctx.reply(
+        "订单号识别失败，请检查是否复制完整后重新输入。"
+      );
+      return;
+    }
+  }
 
-  const adminId = Number(ctx.from.id);
-  const todayKey = getDateKeyInTimezone(new Date(), TIMEZONE);
+  // 识别成功：记录订单，标记验证通过，发入群按钮，并向管理员发工单
+  adminState.delete(userId);
 
   const client = await pool.connect();
+  let ticketId;
   try {
-    await clearUserState(adminId);
-
+    await client.query("BEGIN");
     await client.query(
-      `
-      INSERT INTO dh_quota (user_id, date_key, used_count, next_allowed_at, updated_at)
-      VALUES ($1, $2, 0, NULL, NOW())
-      ON CONFLICT (user_id)
-      DO UPDATE SET date_key = EXCLUDED.date_key, used_count = 0, next_allowed_at = NULL, updated_at = NOW();
-      `,
-      [adminId, todayKey]
+      `INSERT INTO orders (user_id, order_no, verified)
+       VALUES ($1,$2,TRUE)`,
+      [userId, orderNo]
     );
 
+    // 标记用户为 VIP，可选
     await client.query(
-      `UPDATE bot_users SET first_seen_date = $2, last_seen_at = NOW() WHERE user_id = $1;`,
-      [adminId, todayKey]
+      `UPDATE users SET is_vip=TRUE WHERE user_id=$1`,
+      [userId]
     );
+
+    // 建立工单
+    const u = ctx.from;
+    const now = nowInChina();
+    const { rows: tRows } = await client.query(
+      `INSERT INTO tickets
+       (user_id, username, first_name, last_name, order_no, created_at, last_update, disabled)
+       VALUES ($1,$2,$3,$4,$5,$6,$6,FALSE)
+       RETURNING id`,
+      [
+        userId,
+        u.username || null,
+        u.first_name || null,
+        u.last_name || null,
+        orderNo,
+        now.toJSDate(),
+      ]
+    );
+    ticketId = tRows[0].id;
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    await ctx.reply("系统异常，请稍后再试。");
+    return;
   } finally {
     client.release();
   }
 
-  await ctx.reply("♻️ 已重置你的测试状态：冷却与次数清零，并视为“新用户当天”。");
+  // 发送入群按钮
+  const joinLink = "https://t.me/+495j5rWmApsxYzg9";
+  const kb = new InlineKeyboard().url("💎 加入会员群", joinLink);
+  await ctx.reply(
+    "✅ 订单验证成功！\n\n欢迎加入会员群，解锁更多专属资源与服务：",
+    { reply_markup: kb }
+  );
+
+  // 通知管理员工单
+  const ticketText =
+    `📨 新工单\n\n` +
+    `用户：${ctx.from.first_name || ""} (@${ctx.from.username || "无"})\n` +
+    `用户ID：${ctx.from.id}\n` +
+    `订单号：${orderNo}\n` +
+    `时间（北京时间）：${nowInChina().toFormat("yyyy-LL-dd HH:mm:ss")}\n\n` +
+    `工单ID：${ticketId}`;
+
+  const adminKb = new InlineKeyboard()
+    .text("🗂 查看工单列表", "admin_tickets")
+    .row()
+    .text("🗑 删除此工单", `admin_ticket_del_${ticketId}`);
+
+  for (const aid of ADMIN_IDS) {
+    try {
+      await bot.api.sendMessage(aid, ticketText, {
+        reply_markup: adminKb,
+      });
+    } catch (e) {
+      // 忽略无法发送的管理员
+    }
+  }
 });
 
-/**
- * =========================================================
- * callbackQuery：全部立即 answerCallbackQuery，避免按钮失效
- * =========================================================
- */
-
-bot.callbackQuery("go_start", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showStart(ctx);
+// --- 管理指令 /c /cz ---
+bot.command("c", async (ctx) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return;
+  cancelAdminState(userId);
+  await ctx.reply("已清除当前操作状态。");
 });
 
-bot.callbackQuery("go_v", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showVip(ctx);
+bot.command("cz", async (ctx) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return;
+  await resetAdminDh(userId);
+  await ctx.reply("已重置你的 /dh 次数与冷却，并将你视为“当天新用户”。");
 });
 
-bot.callbackQuery("go_dh", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showDh(ctx);
+// --- /admin 管理面板 ---
+bot.command("admin", async (ctx) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return;
+
+  const kb = new InlineKeyboard()
+    .text("📁 FileID 工具", "admin_fileid")
+    .row()
+    .text("🛒 商品添加 (/p)", "admin_p")
+    .row()
+    .text("📨 工单管理", "admin_tickets")
+    .row()
+    .text("👥 用户表", "admin_users");
+
+  await ctx.reply("管理员面板（仅限管理员访问）：", {
+    reply_markup: kb,
+  });
 });
 
-bot.callbackQuery("v_paid", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-
-  const sent1 = await ctx.replyWithPhoto(FILE_ID_ORDER, { caption: ORDER_GUIDE_TEXT });
-  if (sent1 && sent1.message_id) await registerAutoDelete(ctx.chat.id, sent1.message_id);
-
-  await setUserState(ctx.from.id, "v_wait_order", "0");
-  const sent2 = await ctx.reply("请发送订单号：");
-  if (sent2 && sent2.message_id) await registerAutoDelete(ctx.chat.id, sent2.message_id);
-});
-
-bot.callbackQuery(/^dh_page:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showDhMenu(ctx, Number(ctx.match[1]));
-});
-
-bot.callbackQuery(/^dh_kw:(.+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  const keyword = decodeURIComponent(ctx.match[1]);
-  await dhSendNext(ctx, keyword, 0);
-});
-
-bot.callbackQuery(/^dh_more:(.+):(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  const keyword = decodeURIComponent(ctx.match[1]);
-  const offset = Number(ctx.match[2]);
-  await dhSendNext(ctx, keyword, offset);
-});
-
-bot.callbackQuery("admin_back", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showAdmin(ctx);
-});
-
+// 1) FileID 工具
 bot.callbackQuery("admin_fileid", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  if (!(await requireAdmin(ctx))) return;
-  await setUserState(ctx.from.id, "admin_wait_fileid", "1");
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  adminState.set(userId, { mode: "waiting_fileid", data: {} });
+  await ctx.editMessageText(
+    "请发送一张图片或任意媒体，我会返回对应的 file_id。\n\n获取完成后会自动回到 admin 面板。"
+  ).catch(async () => {
+    await ctx.reply(
+      "请发送一张图片或任意媒体，我会返回对应的 file_id。"
+    );
+  });
+});
 
-  const keyboard = new InlineKeyboard().text("返回", "admin_back");
-  const sent = await ctx.reply("请发送媒体（图片/视频/文件等）以获取 file_id：", { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+bot.on("message", async (ctx, next) => {
+  const userId = ctx.from && ctx.from.id;
+  if (!userId || !isAdmin(userId)) return next();
+
+  const st = adminState.get(userId);
+  if (!st || st.mode !== "waiting_fileid") return next();
+
+  const msg = ctx.message;
+  let fileId = null;
+  let type = null;
+
+  if (msg.photo && msg.photo.length) {
+    const ph = msg.photo[msg.photo.length - 1];
+    fileId = ph.file_id;
+    type = "photo";
+  } else if (msg.document) {
+    fileId = msg.document.file_id;
+    type = "document";
+  } else if (msg.video) {
+    fileId = msg.video.file_id;
+    type = "video";
+  } else if (msg.audio) {
+    fileId = msg.audio.file_id;
+    type = "audio";
+  }
+
+  if (!fileId) {
+    await ctx.reply("未识别到可用媒体，请发送图片、文件、视频或音频。");
+    return;
+  }
+
+  await ctx.reply(
+    `类型：${type}\nfile_id：\n\`${fileId}\``,
+    { parse_mode: "Markdown" }
+  );
+
+  // 取到一次就回到 admin
+  adminState.delete(userId);
+  const kb = new InlineKeyboard()
+    .text("📁 FileID 工具", "admin_fileid")
+    .row()
+    .text("🛒 商品添加 (/p)", "admin_p")
+    .row()
+    .text("📨 工单管理", "admin_tickets")
+    .row()
+    .text("👥 用户表", "admin_users");
+  await ctx.reply("已返回管理员面板：", { reply_markup: kb });
+});
+
+// 2) /p 商品添加与管理
+bot.command("p", async (ctx) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return;
+  await showPList(ctx, 1);
 });
 
 bot.callbackQuery("admin_p", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (e) {}
-  await showP(ctx);
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  await showPList(ctx, 1);
 });
 
-/**
- * =========================================================
- * 兜底：除命令外任何消息进入 /dh（只显示菜单，不自动发内容）
- * 重点修复：不会再“没按就刷屏”
- * =========================================================
- */
+// /p 列表页（与 /dh 同源 keywords）
+async function showPList(ctx, page) {
+  const perPage = 10;
+  const client = await pool.connect();
+  try {
+    const { rows: countRows } = await client.query("SELECT COUNT(*)::int AS c FROM keywords");
+    const total = countRows[0].c;
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const current = Math.min(Math.max(page, 1), totalPages);
+    const offset = (current - 1) * perPage;
 
-bot.on("message", async (ctx) => {
-  if (!ctx.from) return;
+    const { rows } = await client.query(
+      `SELECT id, keyword, created_at
+       FROM keywords
+       ORDER BY created_at ASC
+       LIMIT $1 OFFSET $2`,
+      [perPage, offset]
+    );
 
-  // 命令不在这里处理
-  if (ctx.message && typeof ctx.message.text === "string") {
-    const t = ctx.message.text.trim();
-    if (t.startsWith("/")) return;
-  }
-
-  const st = await getUserState(ctx.from.id);
-
-  // /v 等待订单号优先
-  if (st.key === "v_wait_order") {
-    if (ctx.message && typeof ctx.message.text === "string") {
-      await handleVipOrderInput(ctx);
+    let text = `🛒 商品关键词列表\n${buildPageHeader(current, totalPages)}\n\n`;
+    if (rows.length === 0) {
+      text += "当前没有已上架的关键词。";
     } else {
-      await ctx.reply("请发送订单号文本（不要发送图片/文件）。");
-    }
-    return;
-  }
-
-  // /p 流程优先（管理员）
-  if (isAdmin(ctx) && st.key === "p_wait_keyword") {
-    if (ctx.message && typeof ctx.message.text === "string") {
-      const keyword = String(ctx.message.text || "").trim();
-      if (!keyword) {
-        await ctx.reply("关键词不能为空，请重新输入。");
-        return;
+      for (const r of rows) {
+        text += `- ${r.keyword} (ID: ${r.id})\n`;
       }
-      await setUserState(ctx.from.id, "p_wait_content", keyword);
-
-      const client = await pool.connect();
-      try {
-        await client.query(`DELETE FROM p_buffer WHERE admin_id = $1 AND keyword = $2;`, [Number(ctx.from.id), keyword]);
-      } finally {
-        client.release();
-      }
-
-      const keyboard = new InlineKeyboard()
-        .text("返回", "admin_p")
-        .row()
-        .text("✅ 完成上架", "p_publish");
-
-      await ctx.reply(
-        `关键词已设置为：${keyword}\n\n请开始发送内容（支持任何格式，逐条记录）。\n发送完后点击 ✅ 完成上架。`,
-        { reply_markup: keyboard }
-      );
-      return;
-    }
-    await ctx.reply("请输入关键词文本。");
-    return;
-  }
-
-  if (isAdmin(ctx) && st.key === "p_wait_content") {
-    const extracted = tryExtractContentForStorage(ctx.message);
-    if (!extracted) {
-      await ctx.reply("该类型暂不支持记录，请发送文本/图片/视频/文件等。");
-      return;
     }
 
-    const keyword = st.value;
-    const client = await pool.connect();
-    try {
-      await client.query(
-        `INSERT INTO p_buffer (admin_id, keyword, content_type, content_data) VALUES ($1, $2, $3, $4);`,
-        [Number(ctx.from.id), String(keyword), extracted.contentType, extracted.contentData]
-      );
-    } finally {
-      client.release();
+    const kb = new InlineKeyboard();
+    kb.text("➕ 上架新关键词", "p_add_new").row();
+
+    for (const r of rows) {
+      kb.text(`🗑 删 ${r.keyword}`, `p_del_${r.id}`).row();
     }
 
-    await ctx.reply("✅ 已记录一条内容。继续发送，或点击 ✅ 完成上架。");
-    return;
-  }
-
-  // FileID 获取（管理员）
-  if (isAdmin(ctx) && st.key === "admin_wait_fileid") {
-    const fileId = extractFirstFileIdFromMessage(ctx.message);
-    if (!fileId) {
-      await ctx.reply("未检测到可提取的媒体 file_id，请重新发送媒体内容。");
-      return;
+    if (totalPages > 1) {
+      if (current > 1) kb.text("⬅️ 上一页", `p_page_${current - 1}`);
+      if (current < totalPages) kb.text("➡️ 下一页", `p_page_${current + 1}`);
+      kb.row();
     }
-    await clearUserState(ctx.from.id);
-    await ctx.reply(`🆔 file_id：${fileId}`);
-    await showAdmin(ctx);
-    return;
-  }
 
-  // 默认：进入 /dh，但只显示菜单（不会自动发内容）
-  const allow = await dhCheckAndConsumeQuota(ctx);
-  if (!allow.allowed) {
-    await sendDhBlocked(ctx, allow);
-    return;
+    kb.text("↩️ 返回 admin", "back_admin");
+
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+        await ctx.reply(text, { reply_markup: kb });
+      });
+    } else {
+      await ctx.reply(text, { reply_markup: kb });
+    }
+  } finally {
+    client.release();
   }
-  await showDhMenu(ctx, 0);
+}
+
+bot.callbackQuery(/p_page_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const page = Number(ctx.match[1]);
+  await showPList(ctx, page);
 });
 
-/**
- * =========================================================
- * middleware 已确保：先清理过期消息，再执行命令/按钮/消息
- * =========================================================
- */
+// 上架新关键词流程
+bot.callbackQuery("p_add_new", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const userId = ctx.from.id;
+  adminState.set(userId, { mode: "p_waiting_keyword", data: {} });
+  await ctx.editMessageText("请输入要上架的关键词（例如：1）：").catch(async () => {
+    await ctx.reply("请输入要上架的关键词（例如：1）：");
+  });
+});
 
-/**
- * =========================================================
- * Vercel handler
- * =========================================================
- */
+bot.on("message:text", async (ctx, next) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return next();
 
-const handler = webhookCallback(bot, "http");
+  const st = adminState.get(userId);
+  if (!st || st.mode !== "p_waiting_keyword") return next();
 
-module.exports = async (req, res) => {
-  if (req.method === "GET") {
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.end("OK");
+  const keyword = ctx.message.text.trim();
+  if (!keyword) {
+    await ctx.reply("关键词不能为空，请重新输入：");
     return;
   }
-  if (req.method === "POST") {
-    return handler(req, res);
+
+  const client = await pool.connect();
+  let keywordId;
+  try {
+    const { rows } = await client.query(
+      `INSERT INTO keywords (keyword) VALUES ($1) RETURNING id`,
+      [keyword]
+    );
+    keywordId = rows[0].id;
+  } finally {
+    client.release();
   }
-  res.statusCode = 405;
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.end("Method Not Allowed");
+
+  adminState.set(userId, {
+    mode: "p_waiting_contents",
+    data: { keywordId, keyword },
+  });
+
+  const kb = new Keyboard().text("✅ 完成上架").resized();
+  await ctx.reply(
+    `关键词 "${keyword}" 已创建。\n\n请连续发送该商品的所有内容（支持文本、图片、文件、视频等，逐条发送）。\n\n发送完成后，请点击键盘下方的“✅ 完成上架”。`,
+    { reply_markup: kb }
+  );
+});
+
+// 在“等待内容”状态下，记录所有消息
+bot.on("message", async (ctx, next) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return next();
+
+  const st = adminState.get(userId);
+  if (!st || st.mode !== "p_waiting_contents") return next();
+
+  const { keywordId } = st.data;
+  const msg = ctx.message;
+
+  // 如果文本刚好是 “✅ 完成上架”，让另一段逻辑处理
+  if (msg.text && msg.text === "✅ 完成上架") return next();
+
+  const client = await pool.connect();
+  try {
+    if (msg.text) {
+      await client.query(
+        `INSERT INTO keyword_contents (keyword_id, content_type, payload)
+         VALUES ($1,'text',$2::jsonb)`,
+        [keywordId, JSON.stringify({ text: msg.text })]
+      );
+    } else if (msg.photo && msg.photo.length) {
+      const ph = msg.photo[msg.photo.length - 1];
+      await client.query(
+        `INSERT INTO keyword_contents (keyword_id, content_type, payload)
+         VALUES ($1,'photo',$2::jsonb)`,
+        [
+          keywordId,
+          JSON.stringify({
+            file_id: ph.file_id,
+            caption: msg.caption || null,
+          }),
+        ]
+      );
+    } else if (msg.document) {
+      await client.query(
+        `INSERT INTO keyword_contents (keyword_id, content_type, payload)
+         VALUES ($1,'document',$2::jsonb)`,
+        [
+          keywordId,
+          JSON.stringify({
+            file_id: msg.document.file_id,
+            caption: msg.caption || null,
+          }),
+        ]
+      );
+    } else if (msg.video) {
+      await client.query(
+        `INSERT INTO keyword_contents (keyword_id, content_type, payload)
+         VALUES ($1,'video',$2::jsonb)`,
+        [
+          keywordId,
+          JSON.stringify({
+            file_id: msg.video.file_id,
+            caption: msg.caption || null,
+          }),
+        ]
+      );
+    } else {
+      await ctx.reply("已收到一条暂不支持的消息类型，未记录。");
+    }
+  } finally {
+    client.release();
+  }
+
+  return;
+});
+
+// 捕捉“✅ 完成上架”
+bot.on("message:text", async (ctx, next) => {
+  const userId = ctx.from.id;
+  if (!isAdmin(userId)) return next();
+
+  const st = adminState.get(userId);
+  if (!st || st.mode !== "p_waiting_contents") return next();
+
+  if (ctx.message.text !== "✅ 完成上架") return next();
+
+  adminState.delete(userId);
+  // 切回普通键盘
+  await ctx.reply("已完成上架。", {
+    reply_markup: { remove_keyboard: true },
+  });
+  await showPList(ctx, 1);
+});
+
+// 删除关键词（两次确认）
+bot.callbackQuery(/p_del_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const kid = Number(ctx.match[1]);
+  const kb = new InlineKeyboard()
+    .text("❌ 确认删除", `p_del_confirm_${kid}`)
+    .row()
+    .text("↩️ 取消", "admin_p");
+  await ctx.answerCallbackQuery();
+  await ctx.reply("确定要删除该关键词及其所有内容吗？", {
+    reply_markup: kb,
+  });
+});
+
+bot.callbackQuery(/p_del_confirm_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const kid = Number(ctx.match[1]);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM keyword_contents WHERE keyword_id=$1", [
+      kid,
+    ]);
+    await client.query("DELETE FROM keywords WHERE id=$1", [kid]);
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+  } finally {
+    client.release();
+  }
+  await ctx.answerCallbackQuery("已删除。", { show_alert: true });
+  await showPList(ctx, 1);
+});
+
+// 返回 admin
+bot.callbackQuery("back_admin", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const kb = new InlineKeyboard()
+    .text("📁 FileID 工具", "admin_fileid")
+    .row()
+    .text("🛒 商品添加 (/p)", "admin_p")
+    .row()
+    .text("📨 工单管理", "admin_tickets")
+    .row()
+    .text("👥 用户表", "admin_users");
+  await ctx.editMessageText("管理员面板：", { reply_markup: kb }).catch(async () => {
+    await ctx.reply("管理员面板：", { reply_markup: kb });
+  });
+});
+
+// 3) 工单系统
+bot.callbackQuery("admin_tickets", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  await showTicketList(ctx, 1);
+});
+
+async function showTicketList(ctx, page) {
+  const perPage = 10;
+  const client = await pool.connect();
+  try {
+    const { rows: countRows } = await client.query(
+      "SELECT COUNT(*)::int AS c FROM tickets"
+    );
+    const total = countRows[0].c;
+    if (total === 0) {
+      await ctx.editMessageText("目前没有工单。").catch(async () => {
+        await ctx.reply("目前没有工单。");
+      });
+      return;
+    }
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const current = Math.min(Math.max(page, 1), totalPages);
+    const offset = (current - 1) * perPage;
+
+    const { rows } = await client.query(
+      `SELECT id, user_id, username, first_name, disabled
+       FROM tickets
+       ORDER BY created_at ASC
+       LIMIT $1 OFFSET $2`,
+      [perPage, offset]
+    );
+
+    let text = `📨 工单列表\n${buildPageHeader(current, totalPages)}\n\n`;
+    const kb = new InlineKeyboard();
+
+    for (const t of rows) {
+      const uname = t.username
+        ? `@${t.username}`
+        : t.first_name || t.user_id;
+      const label = `${uname} (${t.user_id})` + (t.disabled ? " [停用]" : "");
+      text += `- ${label}\n`;
+      kb.text(label, `ticket_detail_${t.id}`).row();
+    }
+
+    if (totalPages > 1) {
+      if (current > 1) kb.text("⬅️ 上一页", `ticket_page_${current - 1}`);
+      if (current < totalPages) kb.text("➡️ 下一页", `ticket_page_${current + 1}`);
+      kb.row();
+    }
+
+    kb.text("↩️ 返回 admin", "back_admin");
+
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+      await ctx.reply(text, { reply_markup: kb });
+    });
+  } finally {
+    client.release();
+  }
+}
+
+bot.callbackQuery(/ticket_page_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const page = Number(ctx.match[1]);
+  await showTicketList(ctx, page);
+});
+
+bot.callbackQuery(/ticket_detail_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const id = Number(ctx.match[1]);
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT *
+       FROM tickets
+       WHERE id=$1`,
+      [id]
+    );
+    if (rows.length === 0) {
+      await ctx.answerCallbackQuery("该工单不存在");
+      return;
+    }
+    const t = rows[0];
+    const first = DateTime.fromJSDate(t.created_at)
+      .setZone("Asia/Shanghai")
+      .toFormat("yyyy-LL-dd HH:mm:ss");
+    const last = DateTime.fromJSDate(t.last_update)
+      .setZone("Asia/Shanghai")
+      .toFormat("yyyy-LL-dd HH:mm:ss");
+
+    const text =
+      `📨 工单详情（ID: ${t.id}）\n\n` +
+      `用户名字：${t.first_name || ""}\n` +
+      `用户名：@${t.username || "无"}\n` +
+      `用户ID：${t.user_id}\n` +
+      `订单编号：${t.order_no}\n\n` +
+      `首次（北京时间）：${first}\n` +
+      `最近（北京时间）：${last}\n` +
+      `停用状态：${t.disabled ? "已停用" : "正常"}`;
+
+    const kb = new InlineKeyboard()
+      .text("🗑 删除工单", `admin_ticket_del_${t.id}`)
+      .row()
+      .text("↩️ 返回工单列表", "admin_tickets");
+
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+      await ctx.reply(text, { reply_markup: kb });
+    });
+  } finally {
+    client.release();
+  }
+});
+
+bot.callbackQuery(/admin_ticket_del_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const id = Number(ctx.match[1]);
+
+  const client = await pool.connect();
+  try {
+    await client.query("DELETE FROM tickets WHERE id=$1", [id]);
+  } finally {
+    client.release();
+  }
+  await ctx.answerCallbackQuery("工单已删除", { show_alert: true });
+  await showTicketList(ctx, 1);
+});
+
+// 4) 用户表（简单分页展示）
+bot.callbackQuery("admin_users", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  await showUserList(ctx, 1);
+});
+
+async function showUserList(ctx, page) {
+  const perPage = 10;
+  const client = await pool.connect();
+  try {
+    const { rows: countRows } = await client.query(
+      "SELECT COUNT(*)::int AS c FROM users"
+    );
+    const total = countRows[0].c;
+    if (total === 0) {
+      await ctx.editMessageText("当前没有用户记录。").catch(async () => {
+        await ctx.reply("当前没有用户记录。");
+      });
+      return;
+    }
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const current = Math.min(Math.max(page, 1), totalPages);
+    const offset = (current - 1) * perPage;
+
+    const { rows } = await client.query(
+      `SELECT user_id, username, first_name, is_vip, is_admin
+       FROM users
+       ORDER BY first_seen_at ASC
+       LIMIT $1 OFFSET $2`,
+      [perPage, offset]
+    );
+
+    let text = `👥 用户表\n${buildPageHeader(current, totalPages)}\n\n`;
+    for (const u of rows) {
+      text += `ID: ${u.user_id}, 用户名: @${u.username || "无"}, 名称: ${
+        u.first_name || ""
+      }, VIP: ${u.is_vip ? "是" : "否"}, 管理员: ${
+        u.is_admin ? "是" : "否"
+      }\n`;
+    }
+
+    const kb = new InlineKeyboard();
+    if (totalPages > 1) {
+      if (current > 1) kb.text("⬅️ 上一页", `users_page_${current - 1}`);
+      if (current < totalPages) kb.text("➡️ 下一页", `users_page_${current + 1}`);
+      kb.row();
+    }
+    kb.text("↩️ 返回 admin", "back_admin");
+
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(async () => {
+      await ctx.reply(text, { reply_markup: kb });
+    });
+  } finally {
+    client.release();
+  }
+}
+
+bot.callbackQuery(/users_page_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const page = Number(ctx.match[1]);
+  await showUserList(ctx, page);
+});
+
+// --- Vercel 入口函数（Webhook）---
+module.exports = async (req, res) => {
+  // 设置 Webhook（仅第一次）
+  if (!webhookSet) {
+    const url = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}/api/index`;
+    try {
+      await bot.api.setWebhook(url);
+      webhookSet = true;
+      console.log("Webhook set to:", url);
+    } catch (e) {
+      console.error("Failed to set webhook:", e);
+    }
+  }
+
+  if (req.method === "POST") {
+    const body = req.body;
+    try {
+      await bot.handleUpdate(body);
+    } catch (e) {
+      console.error("Error handling update:", e);
+    }
+    res.status(200).json({ ok: true });
+  } else {
+    res.status(200).send("OK");
+  }
 };
