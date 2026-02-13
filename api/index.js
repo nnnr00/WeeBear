@@ -49,8 +49,8 @@ function formatDateTimeChina(date) {
   const m = String(cn.getMonth() + 1).padStart(2, "0");
   const day = String(cn.getDate()).padStart(2, "0");
   const hh = String(cn.getHours()).padStart(2, "0");
-  const mm = String(cn.getMinutes() + "").padStart(2, "0");
-  const ss = String(cn.getSeconds() + "").padStart(2, "0");
+  const mm = String(cn.getMinutes()).padStart(2, "0");
+  const ss = String(cn.getSeconds()).padStart(2, "0");
   return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
 
@@ -63,7 +63,7 @@ function formatDuration(ms) {
 }
 
 function buildPageHeader(current, total) {
-  return `📄 ${current}/${total}`;
+  return `📄 第 ${current} 页 / 共 ${total} 页`;
 }
 
 // --------------------- 状态与用户处理 ---------------------
@@ -429,7 +429,7 @@ bot.command("c", async (ctx) => {
   const uid = ctx.from.id;
   if (!isAdmin(uid)) return;
   adminState.delete(uid);
-  await ctx.reply("已清除当前操作状态。");
+  await ctx.reply("✅ 已清除当前操作状态。");
   await showAdminPanel(ctx.chat.id);
 });
 
@@ -455,7 +455,7 @@ bot.command("cz", async (ctx) => {
   }
 
   await ctx.reply(
-    "已重置你的 /dh 次数与冷却，并将你视为当天新用户。"
+    "✅ 已重置你的 /dh 次数与冷却，并将你视为当天新用户。"
   );
   await sendStartPage(ctx.chat.id);
 });
@@ -472,9 +472,11 @@ async function showAdminPanel(chatId) {
     .row()
     .text("👥 用户表", "admin_users");
 
-  await bot.api.sendMessage(chatId, "管理员面板（仅限管理员访问）：", {
-    reply_markup: kb,
-  });
+  await bot.api.sendMessage(
+    chatId,
+    "🛠 管理员面板（仅限管理员访问）：\n\n请从下方选择要执行的功能 👇",
+    { reply_markup: kb }
+  );
 }
 
 bot.command("admin", async (ctx) => {
@@ -495,20 +497,23 @@ bot.callbackQuery("admin_fileid", async (ctx) => {
   adminState.set(ctx.from.id, { mode: "waiting_fileid", data: {} });
 
   const text =
-    "请发送一张图片或任意媒体，我会返回对应的 file_id。\n\n" +
-    "获取完成后，你可以通过下方按钮返回 admin 或商品管理。";
+    "📁 FileID 获取工具\n\n" +
+    "请发送一张图片、视频、文件或音频，我会返回对应的 file_id。\n\n" +
+    "获取完成后，你可以通过下方按钮返回 admin 或进入商品管理。";
 
   await ctx
     .editMessageText(text)
     .catch(async () => await ctx.reply(text));
 });
 
+// 全局 message 处理：先 upsert 用户，然后处理 fileid / /dh 自动跳转
 bot.on("message", async (ctx, next) => {
-  // 全局：先保证用户信息入库（避免 /dh 提示“用户数据初始化中”）
   await upsertUserAndNotifyNew(ctx);
 
   const uid = ctx.from.id;
   const st = adminState.get(uid);
+
+  // FileID 模式
   if (isAdmin(uid) && st && st.mode === "waiting_fileid") {
     const msg = ctx.message;
     let fileId = null;
@@ -531,13 +536,13 @@ bot.on("message", async (ctx, next) => {
 
     if (!fileId) {
       await ctx.reply(
-        "未识别到可用媒体，请发送图片、文件、视频或音频。"
+        "❗ 未识别到可用媒体，请发送图片、文件、视频或音频。"
       );
       return;
     }
 
     await ctx.reply(
-      `类型：${type}\nfile_id：\n\`${fileId}\``,
+      `📁 FileID 获取成功\n\n类型：${type}\nfile_id：\n\`${fileId}\``,
       { parse_mode: "Markdown" }
     );
 
@@ -548,13 +553,19 @@ bot.on("message", async (ctx, next) => {
       .row()
       .text("🛒 商品添加", "admin_p");
 
-    await ctx.reply("操作完成，你可以选择返回：", {
+    await ctx.reply("✅ 操作完成，你可以选择继续操作：", {
       reply_markup: kb,
     });
     return;
   }
 
-  return next();
+  // 如果是命令（/xxx），交给后面的命令处理
+  if (ctx.message.text && ctx.message.text.startsWith("/")) {
+    return next();
+  }
+
+  // 非命令文本：自动跳转为 /dh 入口（start=dh）
+  await handleDhEntry(ctx);
 });
 
 // --------------------- /p 商品添加与管理 ---------------------
@@ -589,16 +600,17 @@ async function showPList(ctx, page) {
       [perPage, offset]
     );
 
-    let text = `🛒 商品关键词列表\n${buildPageHeader(
-      current,
-      totalPages
-    )}\n\n`;
+    let text =
+      "🛒 商品关键词管理\n" +
+      buildPageHeader(current, totalPages) +
+      "\n\n";
 
     if (rows.length === 0) {
-      text += "当前没有已上架的关键词。";
+      text += "当前还没有任何商品关键词，请点击下方按钮进行上架。";
     } else {
+      text += "以下为已上架的关键词列表：\n\n";
       for (const r of rows) {
-        text += `- ${r.keyword} (ID: ${r.id})\n`;
+        text += `▫️ 关键词：${r.keyword}（ID: ${r.id}）\n`;
       }
     }
 
@@ -606,7 +618,7 @@ async function showPList(ctx, page) {
     kb.text("➕ 上架新关键词", "p_add_new").row();
 
     for (const r of rows) {
-      kb.text(`🗑 删 ${r.keyword}`, `p_del_${r.id}`).row();
+      kb.text(`⚙ 管理「${r.keyword}」`, `p_manage_${r.id}`).row();
     }
 
     if (totalPages > 1) {
@@ -640,8 +652,12 @@ bot.callbackQuery("p_add_new", async (ctx) => {
   adminState.set(ctx.from.id, { mode: "p_waiting_keyword", data: {} });
 
   await ctx
-    .editMessageText("请输入要上架的关键词（例如：1）：")
-    .catch(async () => await ctx.reply("请输入要上架的关键词（例如：1）："));
+    .editMessageText(
+      "🆕 上架新关键词\n\n请发送要上架的关键词（例如：1）："
+    )
+    .catch(async () => await ctx.reply(
+      "🆕 上架新关键词\n\n请发送要上架的关键词（例如：1）："
+    ));
 });
 
 bot.on("message:text", async (ctx, next) => {
@@ -654,7 +670,7 @@ bot.on("message:text", async (ctx, next) => {
 
   const keyword = ctx.message.text.trim();
   if (!keyword) {
-    await ctx.reply("关键词不能为空，请重新输入：");
+    await ctx.reply("❗ 关键词不能为空，请重新输入：");
     return;
   }
 
@@ -677,7 +693,7 @@ bot.on("message:text", async (ctx, next) => {
 
   const kb = new Keyboard().text("✅ 完成上架").resized();
   await ctx.reply(
-    `关键词 "${keyword}" 已创建。\n\n请连续发送该商品的所有内容（支持文本、图片、文件、视频等，逐条发送）。\n\n发送完成后，请点击键盘下方的“✅ 完成上架”。`,
+    `✅ 关键词「${keyword}」已创建。\n\n请连续发送该商品的所有内容（支持文本、图片、文件、视频等，逐条发送）。\n\n发送完成后，请点击键盘下方的“✅ 完成上架”。`,
     { reply_markup: kb }
   );
 });
@@ -743,13 +759,11 @@ bot.on("message", async (ctx, next) => {
         ]
       );
     } else {
-      await ctx.reply("已收到一条暂不支持的消息类型，未记录。");
+      await ctx.reply("⚠ 已收到一条暂不支持的消息类型，未记录。");
     }
   } finally {
     client.release();
   }
-
-  return;
 });
 
 bot.on("message:text", async (ctx, next) => {
@@ -763,26 +777,52 @@ bot.on("message:text", async (ctx, next) => {
   if (ctx.message.text !== "✅ 完成上架") return next();
 
   adminState.delete(uid);
-  await ctx.reply("已完成上架。", { reply_markup: { remove_keyboard: true } });
+  await ctx.reply("✅ 已完成上架。", {
+    reply_markup: { remove_keyboard: true },
+  });
   await showPList(ctx, 1);
 });
 
-// 删除关键词
-bot.callbackQuery(/p_del_(\d+)/, async (ctx) => {
+// 管理单个关键词（详情页）
+bot.callbackQuery(/p_manage_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const kid = Number(ctx.match[1]);
 
-  const kb = new InlineKeyboard()
-    .text("❌ 确认删除", `p_del_confirm_${kid}`)
-    .row()
-    .text("↩️ 取消", "admin_p");
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT id, keyword, created_at
+       FROM keywords
+       WHERE id=$1`,
+      [kid]
+    );
+    if (rows.length === 0) {
+      await ctx.answerCallbackQuery("该关键词不存在");
+      return;
+    }
+    const k = rows[0];
 
-  await ctx.answerCallbackQuery();
-  await ctx.reply("确定要删除该关键词及其所有内容吗？", {
-    reply_markup: kb,
-  });
+    const text =
+      `🧾 关键词详情\n\n` +
+      `关键词：${k.keyword}\n` +
+      `ID：${k.id}\n` +
+      `上架时间（北京时间）：${formatDateTimeChina(k.created_at)}\n\n` +
+      "你可以在此删除该关键词及其所有内容。";
+
+    const kb = new InlineKeyboard()
+      .text("❌ 确认删除", `p_del_confirm_${k.id}`)
+      .row()
+      .text("↩️ 返回商品列表", "admin_p");
+
+    await ctx
+      .editMessageText(text, { reply_markup: kb })
+      .catch(async () => await ctx.reply(text, { reply_markup: kb }));
+  } finally {
+    client.release();
+  }
 });
 
+// 删除关键词（已确认）
 bot.callbackQuery(/p_del_confirm_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   const kid = Number(ctx.match[1]);
@@ -803,7 +843,7 @@ bot.callbackQuery(/p_del_confirm_(\d+)/, async (ctx) => {
     client.release();
   }
 
-  await ctx.answerCallbackQuery("已删除。", { show_alert: true });
+  await ctx.answerCallbackQuery("✅ 关键词已删除。", { show_alert: true });
   await showPList(ctx, 1);
 });
 
@@ -822,7 +862,6 @@ async function handleDhEntry(ctx) {
   const user = await getUser(userId);
 
   if (!user) {
-    // 正常情况下不会，因为前面 upsertUser 已经入库
     await ctx.reply("用户数据初始化中，请稍后再试。");
     return;
   }
@@ -917,19 +956,22 @@ async function showDhKeywordsPage(ctx, page) {
       [perPage, offset]
     );
 
-    let text = `${buildPageHeader(
-      current,
-      totalPages
-    )}\n\n请选择要兑换的关键词：`;
+    let text =
+      "🎁 可兑换资源关键词\n" +
+      buildPageHeader(current, totalPages) +
+      "\n\n请选择要兑换的关键词：\n\n";
 
     const kb = new InlineKeyboard();
     for (const r of rows) {
+      text += `▫️ 关键词：${r.keyword}（ID: ${r.id}）\n`;
       kb.text(r.keyword, `dh_kw_${r.id}`).row();
     }
 
     if (totalPages > 1) {
-      if (current > 1) kb.text("⬅️ 上一页", `dh_page_${current - 1}`);
-      if (current < totalPages) kb.text("➡️ 下一页", `dh_page_${current + 1}`);
+      kb.text("⬅️ 上一页", `dh_page_${current - 1}`).text(
+        "➡️ 下一页",
+        `dh_page_${current + 1}`
+      );
       kb.row();
     }
 
@@ -953,6 +995,7 @@ bot.callbackQuery(/dh_page_(\d+)/, async (ctx) => {
   await showDhKeywordsPage(ctx, page);
 });
 
+// 点击关键词：计数 + 冷却 + 分页发送
 bot.callbackQuery(/dh_kw_(\d+)/, async (ctx) => {
   const keywordId = Number(ctx.match[1]);
   const userId = ctx.from.id;
@@ -1011,10 +1054,11 @@ bot.callbackQuery(/dh_kw_(\d+)/, async (ctx) => {
     client.release();
   }
 
-  await sendKeywordContentsGrouped(ctx, keywordId);
+  await sendKeywordContentsGrouped(ctx, keywordId, 0);
 });
 
-async function sendKeywordContentsGrouped(ctx, keywordId, startIndex) {
+// 每页 10 条内容，合并为一条信息发送
+async function sendKeywordContentsGrouped(ctx, keywordId, pageIndex) {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
@@ -1029,73 +1073,68 @@ async function sendKeywordContentsGrouped(ctx, keywordId, startIndex) {
       return;
     }
 
+    const perPage = 10;
     const total = rows.length;
-    const groupSize = 10;
-    const totalGroups = Math.ceil(total / groupSize);
-
-    let start = typeof startIndex === "number" ? startIndex : 0;
-    if (start >= total) {
+    const totalPages = Math.ceil(total / perPage);
+    if (pageIndex >= totalPages) {
       await ctx.answerCallbackQuery("没有更多内容了", { show_alert: true });
       return;
+    }
+
+    const start = pageIndex * perPage;
+    const end = Math.min(start + perPage, total);
+    const groupItems = rows.slice(start, end);
+
+    // 将这一页的 10 条内容合并为一条文本信息
+    let combinedText = `📦 本页共 ${groupItems.length} 条内容\n\n`;
+    let index = start + 1;
+
+    for (const item of groupItems) {
+      const payload = item.payload;
+      const type = item.content_type;
+
+      if (type === "text") {
+        combinedText += `📝 [文本 ${index}]\n${payload.text}\n\n`;
+      } else if (type === "photo") {
+        combinedText +=
+          `🖼 [图片 ${index}] file_id：${payload.file_id}\n` +
+          (payload.caption ? `说明：${payload.caption}\n\n` : "\n");
+      } else if (type === "document") {
+        combinedText +=
+          `📄 [文件 ${index}] file_id：${payload.file_id}\n` +
+          (payload.caption ? `说明：${payload.caption}\n\n` : "\n");
+      } else if (type === "video") {
+        combinedText +=
+          `🎬 [视频 ${index}] file_id：${payload.file_id}\n` +
+          (payload.caption ? `说明：${payload.caption}\n\n` : "\n");
+      } else {
+        combinedText += `❔ [未知类型 ${index}] type=${type}\n\n`;
+      }
+
+      index++;
     }
 
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
 
-    const groupIndex = Math.floor(start / groupSize) + 1;
-    const groupEnd = Math.min(start + groupSize, total);
-    const groupItems = rows.slice(start, groupEnd);
-
-    for (const item of groupItems) {
-      const payload = item.payload;
-      const type = item.content_type;
-      let sent;
-
-      if (type === "text") {
-        sent = await ctx.api.sendMessage(chatId, payload.text);
-      } else if (type === "photo") {
-        sent = await ctx.api.sendPhoto(chatId, payload.file_id, {
-          caption: payload.caption || undefined,
-        });
-      } else if (type === "document") {
-        sent = await ctx.api.sendDocument(chatId, payload.file_id, {
-          caption: payload.caption || undefined,
-        });
-      } else if (type === "video") {
-        sent = await ctx.api.sendVideo(chatId, payload.file_id, {
-          caption: payload.caption || undefined,
-        });
-      } else {
-        sent = await ctx.api.sendMessage(
-          chatId,
-          `收到一种不支持的内容类型：${type}`
-        );
-      }
-
-      if (sent && sent.message_id) {
-        await recordDhMessage(userId, chatId, sent.message_id);
-      }
+    const sent = await ctx.api.sendMessage(chatId, combinedText);
+    if (sent && sent.message_id) {
+      await recordDhMessage(userId, chatId, sent.message_id);
     }
 
-    const progressText = `已发送第 ${groupIndex} 组 / 共 ${totalGroups} 组`;
+    const currentPage = pageIndex + 1;
+    const footerText = `📑 第 ${currentPage} 页 / 共 ${totalPages} 页`;
+
     const kb = new InlineKeyboard();
-
-    if (groupEnd < total) {
-      kb.text(
-        "✨👉 继续发送",
-        `dh_send_next_${keywordId}_${groupEnd}`
-      );
+    if (currentPage < totalPages) {
+      kb.text("✨👉 继续发送下一页", `dh_send_next_${keywordId}_${pageIndex + 1}`);
     }
-
     kb.row().text("💎 加入会员（新春特价）", "start_join_vip").row();
     kb.text("↩️ 返回兑换", "start_dh");
 
-    const progressMsg = await ctx.reply(progressText, {
-      reply_markup: kb,
-    });
-
-    if (progressMsg && progressMsg.message_id) {
-      await recordDhMessage(userId, chatId, progressMsg.message_id);
+    const footerMsg = await ctx.reply(footerText, { reply_markup: kb });
+    if (footerMsg && footerMsg.message_id) {
+      await recordDhMessage(userId, chatId, footerMsg.message_id);
     }
   } finally {
     client.release();
@@ -1104,8 +1143,8 @@ async function sendKeywordContentsGrouped(ctx, keywordId, startIndex) {
 
 bot.callbackQuery(/dh_send_next_(\d+)_(\d+)/, async (ctx) => {
   const keywordId = Number(ctx.match[1]);
-  const startIndex = Number(ctx.match[2]);
-  await sendKeywordContentsGrouped(ctx, keywordId, startIndex);
+  const pageIndex = Number(ctx.match[2]);
+  await sendKeywordContentsGrouped(ctx, keywordId, pageIndex);
 });
 
 // --------------------- 工单管理 ---------------------
@@ -1125,8 +1164,8 @@ async function showTicketList(ctx, page) {
     const total = countRows[0].c;
     if (total === 0) {
       await ctx
-        .editMessageText("目前没有工单。")
-        .catch(async () => await ctx.reply("目前没有工单。"));
+        .editMessageText("📭 当前没有工单记录。")
+        .catch(async () => await ctx.reply("📭 当前没有工单记录。"));
       return;
     }
 
@@ -1142,16 +1181,16 @@ async function showTicketList(ctx, page) {
       [perPage, offset]
     );
 
-    let text = `📨 工单列表\n${buildPageHeader(
-      current,
-      totalPages
-    )}\n\n`;
+    let text =
+      "📨 工单列表\n" +
+      buildPageHeader(current, totalPages) +
+      "\n\n";
 
     const kb = new InlineKeyboard();
     for (const t of rows) {
       const labelName = t.first_name || "无名";
       const label = `${labelName}(${t.user_id})`;
-      text += `- ${label}\n`;
+      text += `▫️ ${label}\n`;
       kb.text(label, `ticket_detail_${t.id}`).row();
     }
 
@@ -1225,7 +1264,7 @@ bot.callbackQuery(/admin_ticket_del_(\d+)/, async (ctx) => {
     client.release();
   }
 
-  await ctx.answerCallbackQuery("工单已删除", { show_alert: true });
+  await ctx.answerCallbackQuery("✅ 工单已删除", { show_alert: true });
   await showTicketList(ctx, 1);
 });
 
@@ -1246,8 +1285,8 @@ async function showUserList(ctx, page) {
     const total = countRows[0].c;
     if (total === 0) {
       await ctx
-        .editMessageText("当前没有用户记录。")
-        .catch(async () => await ctx.reply("当前没有用户记录。"));
+        .editMessageText("👥 当前没有用户记录。")
+        .catch(async () => await ctx.reply("👥 当前没有用户记录。"));
       return;
     }
 
@@ -1263,20 +1302,24 @@ async function showUserList(ctx, page) {
       [perPage, offset]
     );
 
-    let text = `👥 用户表\n${buildPageHeader(
-      current,
-      totalPages
-    )}\n\n`;
+    let text =
+      "👥 用户表\n" +
+      buildPageHeader(current, totalPages) +
+      "\n\n";
 
     const kb = new InlineKeyboard();
     for (const u of rows) {
       text +=
-        `用户：${u.first_name || ""}\n` +
-        `用户名：@${u.username || "无"}\n` +
-        `用户ID：${u.user_id}\n` +
-        `首次使用（北京时间）：${formatDateTimeChina(u.first_seen_at)}\n` +
-        `最近使用（北京时间）：${formatDateTimeChina(u.last_seen_at)}\n` +
-        `是否停用：${u.disabled ? "是" : "否"}\n\n`;
+        `▫️ 用户：${u.first_name || ""}\n` +
+        `   用户名：@${u.username || "无"}\n` +
+        `   用户ID：${u.user_id}\n` +
+        `   首次使用（北京时间）：${formatDateTimeChina(
+          u.first_seen_at
+        )}\n` +
+        `   最近使用（北京时间）：${formatDateTimeChina(
+          u.last_seen_at
+        )}\n` +
+        `   是否停用：${u.disabled ? "是" : "否"}\n\n`;
 
       const label = `${u.first_name || "无名"}(${u.user_id})`;
       kb.text(label, `user_detail_${u.user_id}`).row();
@@ -1375,7 +1418,7 @@ module.exports = async (req, res) => {
           update.callback_query.message.chat.id) ||
         null;
 
-      // 每次更新前，先清理该用户该会话中过期的 /dh 消息
+      // 所有按钮/消息处理前，先清理该用户该会话中过期的 /dh 消息
       if (userId && chatId) {
         await cleanupDhMessages(userId, chatId);
       }
