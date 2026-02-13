@@ -68,7 +68,7 @@ const DH_EMPTY_TEXT =
 const DH_MENU_TEXT =
   "🎁 兑换\n\n" +
   "请选择下方关键词获取内容👇\n" +
-  "（每次发送10条为一组，手动点击继续发送）";
+  "（每次发送10条记录为一组，手动点击继续发送）";
 
 const ADMIN_TEXT =
   "🛠 管理员后台\n" +
@@ -101,18 +101,33 @@ const DAILY_LIMIT_TEXT =
   "✨ 免等待｜⚡ 更稳定｜🔒 更私密\n" +
   "机不可失，时不再来！期待你的加入～";
 
+function buildAdminTicketMessage(user, ticketType, contentLines) {
+  const username = user.username ? `@${user.username}` : "无";
+  const firstName = user.first_name ? String(user.first_name) : (user.firstName ? String(user.firstName) : "无");
+  const timeText = formatBeijingDateTime(new Date());
+
+  return (
+    "📮 工单通知\n\n" +
+    `类型：${ticketType}\n` +
+    `用户：${firstName}（${username}）\n` +
+    `用户ID：${user.id}\n` +
+    `${contentLines}\n` +
+    `时间（北京时间）：${timeText}`
+  );
+}
+
+/**
+ * =========================================================
+ * 依赖与校验
+ * =========================================================
+ */
+
 const { Bot, InlineKeyboard, webhookCallback } = require("grammy");
 const { Pool } = require("pg");
 
-if (!BOT_TOKEN) {
-  throw new Error("Missing BOT_TOKEN environment variable.");
-}
-if (!DATABASE_URL) {
-  throw new Error("Missing DATABASE_URL environment variable.");
-}
-if (!Number.isFinite(ADMIN_ID)) {
-  throw new Error("Missing or invalid ADMIN_ID environment variable.");
-}
+if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN environment variable.");
+if (!DATABASE_URL) throw new Error("Missing DATABASE_URL environment variable.");
+if (!Number.isFinite(ADMIN_ID)) throw new Error("Missing or invalid ADMIN_ID environment variable.");
 if (!(DATABASE_URL.startsWith("postgresql://") || DATABASE_URL.startsWith("postgres://"))) {
   throw new Error("Invalid DATABASE_URL format. It must start with postgresql:// or postgres://");
 }
@@ -123,6 +138,13 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+/**
+ * =========================================================
+ * DB 初始化
+ * =========================================================
+ */
+
 async function ensureTables() {
   const client = await pool.connect();
   try {
@@ -171,6 +193,12 @@ async function ensureTables() {
   }
 }
 
+/**
+ * =========================================================
+ * 时间工具
+ * =========================================================
+ */
+
 function getDateKeyInTimezone(date, timeZone) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -193,6 +221,12 @@ function formatBeijingDateTime(date) {
   });
   return formatter.format(date);
 }
+
+/**
+ * =========================================================
+ * auto_delete 触发式删除
+ * =========================================================
+ */
 
 async function registerAutoDelete(chatId, messageId) {
   const client = await pool.connect();
@@ -240,6 +274,13 @@ async function gcExpiredMessages(ctx) {
     client.release();
   }
 }
+
+/**
+ * =========================================================
+ * state
+ * =========================================================
+ */
+
 async function setUserState(userId, key, value) {
   const client = await pool.connect();
   try {
@@ -279,6 +320,12 @@ async function clearUserState(userId) {
     client.release();
   }
 }
+
+/**
+ * =========================================================
+ * 用户表与停用
+ * =========================================================
+ */
 
 async function upsertBotUser(user) {
   const userId = Number(user.id);
@@ -334,14 +381,18 @@ async function getInactiveStatusText(userId) {
     const lastSeen = new Date(res.rows[0].last_seen_at);
     const inactiveMs = USER_INACTIVE_DAYS * 24 * 60 * 60 * 1000;
     const inactive = Date.now() - lastSeen.getTime() >= inactiveMs;
-    if (inactive) {
-      return `用户停用：${formatBeijingDateTime(lastSeen)}`;
-    }
+    if (inactive) return `用户停用：${formatBeijingDateTime(lastSeen)}`;
     return "用户状态：活跃";
   } finally {
     client.release();
   }
 }
+
+/**
+ * =========================================================
+ * admin auth
+ * =========================================================
+ */
 
 function isAdmin(ctx) {
   return Boolean(ctx.from && Number(ctx.from.id) === Number(ADMIN_ID));
@@ -350,28 +401,18 @@ function isAdmin(ctx) {
 async function requireAdmin(ctx) {
   if (!isAdmin(ctx)) {
     const sent = await ctx.reply("⛔ 无权限访问");
-    if (ctx.chat && sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
     return false;
   }
   return true;
 }
 
-function buildAdminTicketMessage(user, ticketType, contentLines) {
-  const username = user.username ? `@${user.username}` : "无";
-  const firstName = user.first_name ? String(user.first_name) : (user.firstName ? String(user.firstName) : "无");
-  const timeText = formatBeijingDateTime(new Date());
+/**
+ * =========================================================
+ * 工单 pending_reviews
+ * =========================================================
+ */
 
-  return (
-    "📮 工单通知\n\n" +
-    `类型：${ticketType}\n` +
-    `用户：${firstName}（${username}）\n` +
-    `用户ID：${user.id}\n` +
-    `${contentLines}\n` +
-    `时间（北京时间）：${timeText}`
-  );
-}
-
-// ---------- pending_reviews 工单 ----------
 async function insertTicketRow(row) {
   const client = await pool.connect();
   try {
@@ -405,7 +446,6 @@ async function countTickets() {
   }
 }
 
-// 最早在第一页最上面 -> ORDER BY id ASC
 async function listTicketsPageOldestFirst(offset, limit) {
   const client = await pool.connect();
   try {
@@ -433,7 +473,12 @@ async function deleteTicketById(id) {
   }
 }
 
-// ---------- products ----------
+/**
+ * =========================================================
+ * products keyword
+ * =========================================================
+ */
+
 async function listKeywordsOldestFirst() {
   const client = await pool.connect();
   try {
@@ -477,6 +522,13 @@ async function deleteProductsByKeyword(keyword) {
     client.release();
   }
 }
+
+/**
+ * =========================================================
+ * /dh quota
+ * =========================================================
+ */
+
 function getCooldownMinutesByIndex(index) {
   if (index < 0) return 0;
   if (index < COOLDOWN_SEQUENCE_MINUTES.length) return COOLDOWN_SEQUENCE_MINUTES[index];
@@ -582,7 +634,112 @@ async function sendDhBlocked(ctx, blockInfo) {
   }
 }
 
-// ---------------- /start ----------------
+/**
+ * =========================================================
+ * 发送内容（重要）：为了避免刷屏，media_group 每次只发送最多10个媒体
+ * 若 media_group 超过10个媒体，则把“剩余媒体”延后到下一次继续发送（offset inside）
+ * =========================================================
+ */
+
+/**
+ * 我们把“继续发送”offset 设计为两层：
+ * - recordOffset：第几条 products 记录（每组10条记录）
+ * - mediaOffset：当前记录的 media_group 已发送到第几个媒体
+ *
+ * callback data: dh_more:<keyword>:<recordOffset>:<mediaOffset>
+ */
+
+function normalizeMediaType(type) {
+  const t = String(type || "").toLowerCase();
+  if (t === "photo") return "photo";
+  if (t === "video") return "video";
+  if (t === "audio") return "audio";
+  return "document";
+}
+
+async function sendMediaGroupSafely(ctx, mediaArray) {
+  try {
+    const messages = await ctx.api.sendMediaGroup(ctx.chat.id, mediaArray);
+    if (Array.isArray(messages)) {
+      for (const msg of messages) {
+        if (msg && msg.message_id) await registerAutoDelete(ctx.chat.id, msg.message_id);
+      }
+    }
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function sendOneProductRowLimited(ctx, row, mediaOffset) {
+  // 返回 { done: boolean, nextMediaOffset: number }
+  // done=true 表示该条记录已发完；done=false 表示还有剩余媒体，需继续发送
+
+  if (row.content_type === "text") {
+    const sent = await ctx.reply(String(row.content_data || ""));
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    return { done: true, nextMediaOffset: 0 };
+  }
+
+  if (row.content_type === "media_group") {
+    let arr = [];
+    try {
+      const parsed = JSON.parse(row.content_data);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch (error) {
+      arr = [];
+    }
+
+    if (!arr.length) {
+      const sent = await ctx.reply("该内容格式异常，无法发送。");
+      if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+      return { done: true, nextMediaOffset: 0 };
+    }
+
+    const start = Math.max(0, Number(mediaOffset) || 0);
+    const chunk = arr.slice(start, start + 10);
+
+    const media = chunk.map((m) => {
+      const type = normalizeMediaType(m.type);
+      const fileId = String(m.data);
+      if (type === "photo") return { type: "photo", media: fileId };
+      if (type === "video") return { type: "video", media: fileId };
+      if (type === "audio") return { type: "audio", media: fileId };
+      return { type: "document", media: fileId };
+    });
+
+    const ok = await sendMediaGroupSafely(ctx, media);
+    if (!ok) {
+      // 降级逐条
+      for (const m of chunk) {
+        const type = normalizeMediaType(m.type);
+        const fileId = String(m.data);
+        try {
+          let sent = null;
+          if (type === "photo") sent = await ctx.replyWithPhoto(fileId);
+          else if (type === "video") sent = await ctx.replyWithVideo(fileId);
+          else sent = await ctx.replyWithDocument(fileId);
+          if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+        } catch (e) {}
+      }
+    }
+
+    const next = start + chunk.length;
+    const done = next >= arr.length;
+    return { done, nextMediaOffset: done ? 0 : next };
+  }
+
+  const sent = await ctx.reply(String(row.content_data || ""));
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+  return { done: true, nextMediaOffset: 0 };
+}
+
+/**
+ * =========================================================
+ * 页面渲染函数：/start /admin /p /dh
+ * =========================================================
+ */
+
 async function showStart(ctx) {
   const keyboard = new InlineKeyboard()
     .text("💎 加入会员（新春特价）", "go_v")
@@ -591,22 +748,6 @@ async function showStart(ctx) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
-bot.command("start", async (ctx) => {
-  const text = ctx.message && ctx.message.text ? String(ctx.message.text) : "";
-  const parts = text.split(" ").map((p) => p.trim()).filter(Boolean);
-  if (parts.length >= 2 && parts[1] === "dh") {
-    await showDh(ctx);
-    return;
-  }
-  await showStart(ctx);
-});
-
-bot.callbackQuery("go_start", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await showStart(ctx);
-});
-
-// ---------------- /v ----------------
 async function showVip(ctx) {
   const sent1 = await ctx.replyWithPhoto(FILE_ID_PAYMENT, { caption: VIP_TEXT });
   if (sent1 && sent1.message_id) await registerAutoDelete(ctx.chat.id, sent1.message_id);
@@ -620,83 +761,43 @@ async function showVip(ctx) {
   if (sent2 && sent2.message_id) await registerAutoDelete(ctx.chat.id, sent2.message_id);
 }
 
-bot.command("v", async (ctx) => {
-  await showVip(ctx);
-});
-
-bot.callbackQuery("go_v", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await showVip(ctx);
-});
-
-bot.callbackQuery("v_paid", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-
-  const sent1 = await ctx.replyWithPhoto(FILE_ID_ORDER, { caption: ORDER_GUIDE_TEXT });
-  if (sent1 && sent1.message_id) await registerAutoDelete(ctx.chat.id, sent1.message_id);
-
-  await setUserState(ctx.from.id, "v_wait_order", "0");
-  const sent2 = await ctx.reply("请发送订单号：");
-  if (sent2 && sent2.message_id) await registerAutoDelete(ctx.chat.id, sent2.message_id);
-});
-
-function extractOrderNumber20260(text) {
-  const match = String(text || "").match(/\b20260\d+\b/);
-  return match ? match[0] : null;
-}
-
-async function handleVipOrderInput(ctx) {
-  const st = await getUserState(ctx.from.id);
-  const failCount = Number(st.value || "0");
-
-  const orderNumber = extractOrderNumber20260(String(ctx.message.text || "").trim());
-
-  if (!orderNumber) {
-    const newFail = failCount + 1;
-    if (newFail >= 2) {
-      await clearUserState(ctx.from.id);
-      await ctx.reply(ORDER_FAIL_2_TEXT);
-      await showStart(ctx);
-      return;
-    }
-    await setUserState(ctx.from.id, "v_wait_order", String(newFail));
-    await ctx.reply(ORDER_FAIL_1_TEXT);
-    return;
-  }
-
-  const statusText = await getInactiveStatusText(ctx.from.id);
-
-  // 写工单到 pending_reviews（vip）
-  try {
-    await insertTicketRow({
-      user_id: ctx.from.id,
-      username: ctx.from.username ? String(ctx.from.username) : null,
-      first_name: ctx.from.first_name ? String(ctx.from.first_name) : null,
-      review_type: "vip",
-      file_id: null,
-      order_number: orderNumber,
-      status: statusText
-    });
-  } catch (error) {}
-
-  // 私发管理员工单（北京时间）
-  try {
-    const contentLines = `订单号：${orderNumber}\n${statusText}`;
-    await ctx.api.sendMessage(ADMIN_ID, buildAdminTicketMessage(ctx.from, "VIP验证成功", contentLines));
-  } catch (error) {}
-
-  await clearUserState(ctx.from.id);
+async function showAdmin(ctx) {
+  if (!(await requireAdmin(ctx))) return;
 
   const keyboard = new InlineKeyboard()
-    .url("✅ 加入会员群", VIP_GROUP_LINK)
+    .text("🆔 获取 File ID", "admin_fileid")
     .row()
-    .text("🎁 去兑换", "go_dh")
+    .text("商品添加", "admin_p")
+    .row()
+    .text("工单", "admin_tickets")
+    .row()
+    .text("用户表", "admin_users")
     .row()
     .text("🏠 返回首页", "go_start");
 
-  const sent = await ctx.reply("✅ 验证通过，欢迎加入会员！\n点击下方按钮进群：", { reply_markup: keyboard });
+  const sent = await ctx.reply(ADMIN_TEXT, { reply_markup: keyboard });
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
+
+async function showP(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+
+  const keywords = await listKeywordsOldestFirst();
+
+  const keyboard = new InlineKeyboard()
+    .text("➕ 上架新关键词", "p_add")
+    .row();
+
+  for (const kw of keywords.slice(0, 30)) {
+    keyboard.text(`🗑 删除 ${kw}`, `p_del1:${encodeURIComponent(kw)}`).row();
+  }
+
+  keyboard.row().text("返回后台", "admin_back");
+
+  const sent = await ctx.reply(P_HOME_TEXT, { reply_markup: keyboard });
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+}
+
 async function showDh(ctx) {
   const allow = await dhCheckAndConsumeQuota(ctx);
   if (!allow.allowed) {
@@ -717,15 +818,6 @@ async function showDh(ctx) {
 
   await sendDhKeywordPage(ctx, 0);
 }
-
-bot.command("dh", async (ctx) => {
-  await showDh(ctx);
-});
-
-bot.callbackQuery("go_dh", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await showDh(ctx);
-});
 
 async function sendDhKeywordPage(ctx, pageIndex) {
   const keywords = await listKeywordsOldestFirst();
@@ -753,125 +845,64 @@ async function sendDhKeywordPage(ctx, pageIndex) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
-bot.callbackQuery(/^dh_page:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await sendDhKeywordPage(ctx, Number(ctx.match[1]));
-});
+/**
+ * =========================================================
+ * /dh 点击关键词 -> 分组发送（10条记录一组），并支持 media_group 内部继续发送
+ * =========================================================
+ */
 
-function normalizeMediaType(type) {
-  const t = String(type || "").toLowerCase();
-  if (t === "photo") return "photo";
-  if (t === "video") return "video";
-  if (t === "audio") return "audio";
-  return "document";
-}
-
-async function sendMediaGroupSafely(ctx, mediaArray) {
-  try {
-    const messages = await ctx.api.sendMediaGroup(ctx.chat.id, mediaArray);
-    if (Array.isArray(messages)) {
-      for (const msg of messages) {
-        if (msg && msg.message_id) await registerAutoDelete(ctx.chat.id, msg.message_id);
-      }
-    }
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function sendProductRow(ctx, row) {
-  if (!row) return;
-
-  if (row.content_type === "text") {
-    const sent = await ctx.reply(String(row.content_data || ""));
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-
-  if (row.content_type === "media_group") {
-    let arr = [];
-    try {
-      const parsed = JSON.parse(row.content_data);
-      if (Array.isArray(parsed)) arr = parsed;
-    } catch (error) {
-      arr = [];
-    }
-
-    if (!arr.length) {
-      const sent = await ctx.reply("该内容格式异常，无法发送。");
-      if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-      return;
-    }
-
-    for (let i = 0; i < arr.length; i += 10) {
-      const chunk = arr.slice(i, i + 10);
-      const media = chunk.map((m) => {
-        const type = normalizeMediaType(m.type);
-        const fileId = String(m.data);
-        if (type === "photo") return { type: "photo", media: fileId };
-        if (type === "video") return { type: "video", media: fileId };
-        if (type === "audio") return { type: "audio", media: fileId };
-        return { type: "document", media: fileId };
-      });
-
-      const ok = await sendMediaGroupSafely(ctx, media);
-      if (!ok) {
-        for (const m of chunk) {
-          const type = normalizeMediaType(m.type);
-          const fileId = String(m.data);
-          try {
-            let sent = null;
-            if (type === "photo") sent = await ctx.replyWithPhoto(fileId);
-            else if (type === "video") sent = await ctx.replyWithVideo(fileId);
-            else sent = await ctx.replyWithDocument(fileId);
-            if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-          } catch (e) {}
-        }
-      }
-    }
-    return;
-  }
-
-  const sent = await ctx.reply(String(row.content_data || ""));
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
-
-// 点击关键词：10条记录为一组
-bot.callbackQuery(/^dh_kw:(.+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-
-  const keyword = decodeURIComponent(ctx.match[1]);
+async function sendDhRecordsChunk(ctx, keyword, recordOffset, mediaOffset) {
   const rows = await listProductsByKeywordOldestFirst(keyword);
+  const totalRecords = rows.length;
 
-  if (!rows.length) {
+  if (!totalRecords) {
     const sent = await ctx.reply("该关键词暂无内容，请等待管理员上传。");
     if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
     return;
   }
 
-  await sendDhChunk(ctx, keyword, 0);
-});
-
-async function sendDhChunk(ctx, keyword, offset) {
-  const rows = await listProductsByKeywordOldestFirst(keyword);
-  const totalRecords = rows.length;
-
-  const chunk = rows.slice(offset, offset + 10);
-  const groupIndex = Math.floor(offset / 10) + 1;
+  const groupIndex = Math.floor(recordOffset / 10) + 1;
   const groupCount = Math.ceil(totalRecords / 10);
 
   const tip = await ctx.reply(`📦 文件 ${groupIndex}/${groupCount}`);
   if (tip && tip.message_id) await registerAutoDelete(ctx.chat.id, tip.message_id);
 
-  for (const row of chunk) {
-    await sendProductRow(ctx, row);
+  // 取本组最多10条记录
+  const groupRows = rows.slice(recordOffset, recordOffset + 10);
+
+  // 我们按顺序发记录；如果遇到某条 media_group 很长，我们只发它的10个媒体并停下，让继续按钮携带 mediaOffset
+  let currentRecordIndex = 0;
+  let currentMediaOffset = Number(mediaOffset) || 0;
+
+  while (currentRecordIndex < groupRows.length) {
+    const row = groupRows[currentRecordIndex];
+
+    const result = await sendOneProductRowLimited(ctx, row, currentMediaOffset);
+
+    if (!result.done) {
+      // 当前记录媒体还没发完，停止，继续按钮继续发同一条记录的下一段媒体
+      const keyboard = new InlineKeyboard()
+        .text("✨👉 请点击继续发送", `dh_more:${encodeURIComponent(keyword)}:${recordOffset}:${currentRecordIndex}:${result.nextMediaOffset}`)
+        .row()
+        .text("💎 加入会员（新春特价）", "go_v")
+        .row()
+        .text("↩️ 返回兑换", "go_dh");
+
+      const sent = await ctx.reply("已发送部分内容，点击继续发送下一段👇", { reply_markup: keyboard });
+      if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+      return;
+    }
+
+    // 当前记录发完，进入下一条
+    currentRecordIndex += 1;
+    currentMediaOffset = 0;
   }
 
-  const nextOffset = offset + chunk.length;
-  const finished = nextOffset >= totalRecords;
+  // 本组10条记录发完，决定是否还有下一组
+  const nextRecordOffset = recordOffset + groupRows.length;
+  const finishedAll = nextRecordOffset >= totalRecords;
 
-  if (finished) {
+  if (finishedAll) {
     const keyboard = new InlineKeyboard()
       .text("💎 加入会员（新春特价）", "go_v")
       .row()
@@ -883,7 +914,7 @@ async function sendDhChunk(ctx, keyword, offset) {
   }
 
   const keyboard = new InlineKeyboard()
-    .text("✨👉 请点击继续发送", `dh_more:${encodeURIComponent(keyword)}:${nextOffset}`)
+    .text("✨👉 请点击继续发送", `dh_more_group:${encodeURIComponent(keyword)}:${nextRecordOffset}`)
     .row()
     .text("💎 加入会员（新春特价）", "go_v")
     .row()
@@ -893,51 +924,11 @@ async function sendDhChunk(ctx, keyword, offset) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
-bot.callbackQuery(/^dh_more:(.+):(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  const keyword = decodeURIComponent(ctx.match[1]);
-  const offset = Number(ctx.match[2]);
-  await sendDhChunk(ctx, keyword, offset);
-});
-async function showAdmin(ctx) {
-  if (!(await requireAdmin(ctx))) return;
-
-  const keyboard = new InlineKeyboard()
-    .text("🆔 获取 File ID", "admin_fileid")
-    .row()
-    .text("商品添加", "admin_p")
-    .row()
-    .text("工单", "admin_tickets")
-    .row()
-    .text("用户表", "admin_users")
-    .row()
-    .text("🏠 返回首页", "go_start");
-
-  const sent = await ctx.reply(ADMIN_TEXT, { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
-
-bot.command("admin", async (ctx) => {
-  await showAdmin(ctx);
-});
-
-bot.callbackQuery("admin_p", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await showP(ctx);
-});
-
-bot.callbackQuery("admin_tickets", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await sendTicketPage(ctx, 0);
-});
-
-bot.callbackQuery(/^admin_tickets_page:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await sendTicketPage(ctx, Number(ctx.match[1]));
-});
+/**
+ * =========================================================
+ * /admin 工单/用户表/FileID + /p 上架 + /v 校验
+ * =========================================================
+ */
 
 async function sendTicketPage(ctx, pageIndex) {
   const total = await countTickets();
@@ -949,8 +940,8 @@ async function sendTicketPage(ctx, pageIndex) {
 
   const header = `📄 ${safePageIndex + 1}/${pageCount}\n\n工单列表`;
   const keyboard = new InlineKeyboard();
-
   let body = header + "\n\n";
+
   if (!rows.length) {
     body += "暂无工单。";
   } else {
@@ -982,48 +973,6 @@ async function sendTicketPage(ctx, pageIndex) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
-bot.callbackQuery(/^ticket_del1:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-
-  const id = Number(ctx.match[1]);
-  const keyboard = new InlineKeyboard()
-    .text("确认删除", `ticket_del2:${id}`)
-    .row()
-    .text("返回", "admin_tickets");
-
-  const sent = await ctx.reply(`⚠️ 是否删除工单 #${id}？`, { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
-
-bot.callbackQuery(/^ticket_del2:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-
-  const id = Number(ctx.match[1]);
-  const keyboard = new InlineKeyboard()
-    .text("真的确定删除", `ticket_del3:${id}`)
-    .row()
-    .text("返回", "admin_tickets");
-
-  const sent = await ctx.reply(`❗最后确认：真的要删除工单 #${id} 吗？`, { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
-
-bot.callbackQuery(/^ticket_del3:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-
-  const id = Number(ctx.match[1]);
-  await deleteTicketById(id);
-
-  const sent = await ctx.reply(`✅ 已删除工单 #${id}`);
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-
-  await sendTicketPage(ctx, 0);
-});
-
-// ---------- 用户表 ----------
 async function countUsers() {
   const client = await pool.connect();
   try {
@@ -1062,24 +1011,6 @@ async function getUserRow(userId) {
     client.release();
   }
 }
-
-bot.callbackQuery("admin_users", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await sendUsersPage(ctx, 0);
-});
-
-bot.callbackQuery(/^admin_users_page:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await sendUsersPage(ctx, Number(ctx.match[1]));
-});
-
-bot.callbackQuery(/^admin_user:(\d+)$/, async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-  await sendUserDetail(ctx, Number(ctx.match[1]));
-});
 
 async function sendUsersPage(ctx, pageIndex) {
   const total = await countUsers();
@@ -1138,17 +1069,66 @@ async function sendUserDetail(ctx, userId) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
-// ---------- File ID ----------
-bot.callbackQuery("admin_fileid", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
+function extractOrderNumber20260(text) {
+  const match = String(text || "").match(/\b20260\d+\b/);
+  return match ? match[0] : null;
+}
 
-  await setUserState(ctx.from.id, "admin_wait_fileid", "1");
+async function handleVipOrderInput(ctx) {
+  const st = await getUserState(ctx.from.id);
+  const failCount = Number(st.value || "0");
+  const orderNumber = extractOrderNumber20260(String(ctx.message.text || "").trim());
 
-  const keyboard = new InlineKeyboard().text("返回", "admin_back");
-  const sent = await ctx.reply("请发送媒体（图片/视频/文件等）以获取 file_id：", { reply_markup: keyboard });
+  if (!orderNumber) {
+    const newFail = failCount + 1;
+    if (newFail >= 2) {
+      await clearUserState(ctx.from.id);
+      await ctx.reply(ORDER_FAIL_2_TEXT);
+      await showStart(ctx);
+      return;
+    }
+    await setUserState(ctx.from.id, "v_wait_order", String(newFail));
+    await ctx.reply(ORDER_FAIL_1_TEXT);
+    return;
+  }
+
+  const statusText = await getInactiveStatusText(ctx.from.id);
+
+  try {
+    await insertTicketRow({
+      user_id: ctx.from.id,
+      username: ctx.from.username ? String(ctx.from.username) : null,
+      first_name: ctx.from.first_name ? String(ctx.from.first_name) : null,
+      review_type: "vip",
+      file_id: null,
+      order_number: orderNumber,
+      status: statusText
+    });
+  } catch (error) {}
+
+  try {
+    const contentLines = `订单号：${orderNumber}\n${statusText}`;
+    await ctx.api.sendMessage(ADMIN_ID, buildAdminTicketMessage(ctx.from, "VIP验证成功", contentLines));
+  } catch (error) {}
+
+  await clearUserState(ctx.from.id);
+
+  const keyboard = new InlineKeyboard()
+    .url("✅ 加入会员群", VIP_GROUP_LINK)
+    .row()
+    .text("🎁 去兑换", "go_dh")
+    .row()
+    .text("🏠 返回首页", "go_start");
+
+  const sent = await ctx.reply("✅ 验证通过，欢迎加入会员！\n点击下方按钮进群：", { reply_markup: keyboard });
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
+}
+
+/**
+ * =========================================================
+ * File ID 获取
+ * =========================================================
+ */
 
 function extractFirstFileIdFromMessage(message) {
   if (!message) return null;
@@ -1159,72 +1139,11 @@ function extractFirstFileIdFromMessage(message) {
   return null;
 }
 
-bot.callbackQuery("admin_back", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await clearUserState(ctx.from.id);
-  await showAdmin(ctx);
-});
-
-// ---------- /p 商品添加 ----------
-bot.command("p", async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
-  await showP(ctx);
-});
-
-async function showP(ctx) {
-  const keywords = await listKeywordsOldestFirst();
-
-  const keyboard = new InlineKeyboard()
-    .text("➕ 上架新关键词", "p_add")
-    .row();
-
-  for (const kw of keywords.slice(0, 30)) {
-    keyboard.text(`🗑 删除 ${kw}`, `p_del1:${encodeURIComponent(kw)}`).row();
-  }
-
-  keyboard.row().text("返回后台", "admin_back");
-
-  const sent = await ctx.reply(P_HOME_TEXT, { reply_markup: keyboard });
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
-
-bot.callbackQuery("p_add", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  if (!(await requireAdmin(ctx))) return;
-
-  await setUserState(ctx.from.id, "p_wait_keyword", "1");
-  const sent = await ctx.reply("请输入关键词（例如：1）：");
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
-
-async function handlePKeywordInput(ctx) {
-  const keyword = String(ctx.message.text || "").trim();
-  if (!keyword) {
-    const sent = await ctx.reply("关键词不能为空，请重新输入。");
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-    return;
-  }
-
-  await setUserState(ctx.from.id, "p_wait_content", keyword);
-
-  const client = await pool.connect();
-  try {
-    await client.query(`DELETE FROM p_buffer WHERE admin_id = $1 AND keyword = $2;`, [Number(ctx.from.id), keyword]);
-  } finally {
-    client.release();
-  }
-
-  const keyboard = new InlineKeyboard()
-    .text("返回", "admin_p")
-    .row()
-    .text("✅ 完成上架", "p_publish");
-
-  const sent = await ctx.reply(
-    `关键词已设置为：${keyword}\n\n请开始发送内容（支持任何格式，逐条记录）。\n发送完后点击 ✅ 完成上架。`,
-    { reply_markup: keyboard }
-  );
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-}
+/**
+ * =========================================================
+ * /p 商品添加：上架
+ * =========================================================
+ */
 
 function tryExtractContentForStorage(message) {
   if (!message) return null;
@@ -1246,6 +1165,35 @@ function tryExtractContentForStorage(message) {
   }
 
   return null;
+}
+
+async function handlePKeywordInput(ctx) {
+  const keyword = String(ctx.message.text || "").trim();
+  if (!keyword) {
+    const sent = await ctx.reply("关键词不能为空，请重新输入。");
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    return;
+  }
+
+  await setUserState(ctx.from.id, "p_wait_content", keyword);
+
+  const client = await pool.connect();
+  try {
+    await client.query(`DELETE FROM p_buffer WHERE admin_id = $1 AND keyword = $2;`, [Number(ctx.from.id), keyword]);
+  } finally {
+    client.release();
+  }
+
+  const keyboard = new InlineKeyboard()
+    .text("返回", "admin_p")
+    .row()
+    .text("✅ 完成上架", "p_publish"); // 最下方
+
+  const sent = await ctx.reply(
+    `关键词已设置为：${keyword}\n\n请开始发送内容（支持任何格式，逐条记录）。\n发送完后点击 ✅ 完成上架。`,
+    { reply_markup: keyboard }
+  );
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
 async function handlePContentInput(ctx) {
@@ -1273,6 +1221,340 @@ async function handlePContentInput(ctx) {
   if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
 }
 
+/**
+ * =========================================================
+ * middleware：必须放在最前（关键修复点）
+ * =========================================================
+ */
+
+bot.use(async (ctx, next) => {
+  await ensureTables();
+  await gcExpiredMessages(ctx);
+
+  if (ctx.from) {
+    const info = await upsertBotUser(ctx.from);
+    if (info.isFirstSeenEver) {
+      const statusText = "用户状态：首次启动";
+      try {
+        await insertTicketRow({
+          user_id: ctx.from.id,
+          username: ctx.from.username ? String(ctx.from.username) : null,
+          first_name: ctx.from.first_name ? String(ctx.from.first_name) : null,
+          review_type: "first_open",
+          file_id: null,
+          order_number: null,
+          status: statusText
+        });
+      } catch (error) {}
+
+      try {
+        await ctx.api.sendMessage(ADMIN_ID, buildAdminTicketMessage(ctx.from, "首次启动", statusText));
+      } catch (error) {}
+    }
+  }
+
+  await next();
+});
+
+/**
+ * =========================================================
+ * 命令：必须在 on(message) 之前注册（关键修复点）
+ * =========================================================
+ */
+
+bot.command("start", async (ctx) => {
+  const text = ctx.message && ctx.message.text ? String(ctx.message.text) : "";
+  const parts = text.split(" ").map((p) => p.trim()).filter(Boolean);
+  if (parts.length >= 2 && parts[1] === "dh") {
+    await showDh(ctx);
+    return;
+  }
+  await showStart(ctx);
+});
+
+bot.command("v", async (ctx) => {
+  await showVip(ctx);
+});
+
+bot.command("dh", async (ctx) => {
+  await showDh(ctx);
+});
+
+bot.command("admin", async (ctx) => {
+  await showAdmin(ctx);
+});
+
+bot.command("p", async (ctx) => {
+  await showP(ctx);
+});
+
+bot.command("c", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+  await clearUserState(ctx.from.id);
+  const sent = await ctx.reply("✅ 已取消你当前的验证/上架等待状态。");
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+bot.command("cz", async (ctx) => {
+  if (!(await requireAdmin(ctx))) return;
+
+  const adminId = Number(ctx.from.id);
+  const todayKey = getDateKeyInTimezone(new Date(), TIMEZONE);
+
+  const client = await pool.connect();
+  try {
+    await clearUserState(adminId);
+
+    await client.query(
+      `
+      INSERT INTO dh_quota (user_id, date_key, used_count, next_allowed_at, updated_at)
+      VALUES ($1, $2, 0, NULL, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET date_key = EXCLUDED.date_key, used_count = 0, next_allowed_at = NULL, updated_at = NOW();
+      `,
+      [adminId, todayKey]
+    );
+
+    await client.query(
+      `UPDATE bot_users SET first_seen_date = $2, last_seen_at = NOW() WHERE user_id = $1;`,
+      [adminId, todayKey]
+    );
+  } finally {
+    client.release();
+  }
+
+  const sent = await ctx.reply("♻️ 已重置你的测试状态：冷却与次数清零，并视为“新用户当天”。");
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+/**
+ * =========================================================
+ * callback：全部第一时间 answerCallbackQuery（关键修复点）
+ * =========================================================
+ */
+
+bot.callbackQuery("go_start", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showStart(ctx);
+});
+
+bot.callbackQuery("go_v", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showVip(ctx);
+});
+
+bot.callbackQuery("go_dh", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showDh(ctx);
+});
+
+bot.callbackQuery("v_paid", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+
+  const sent1 = await ctx.replyWithPhoto(FILE_ID_ORDER, { caption: ORDER_GUIDE_TEXT });
+  if (sent1 && sent1.message_id) await registerAutoDelete(ctx.chat.id, sent1.message_id);
+
+  await setUserState(ctx.from.id, "v_wait_order", "0");
+  const sent2 = await ctx.reply("请发送订单号：");
+  if (sent2 && sent2.message_id) await registerAutoDelete(ctx.chat.id, sent2.message_id);
+});
+
+bot.callbackQuery(/^dh_page:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendDhKeywordPage(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^dh_kw:(.+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  const keyword = decodeURIComponent(ctx.match[1]);
+  await sendDhRecordsChunk(ctx, keyword, 0, 0);
+});
+
+// 继续发送：同一组内继续某条记录的剩余媒体
+bot.callbackQuery(/^dh_more:(.+):(\d+):(\d+):(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  const keyword = decodeURIComponent(ctx.match[1]);
+  const recordOffset = Number(ctx.match[2]);
+  const recordIndexInGroup = Number(ctx.match[3]);
+  const mediaOffset = Number(ctx.match[4]);
+
+  const rows = await listProductsByKeywordOldestFirst(keyword);
+  const groupRows = rows.slice(recordOffset, recordOffset + 10);
+
+  if (recordIndexInGroup < 0 || recordIndexInGroup >= groupRows.length) {
+    const sent = await ctx.reply("该按钮已过期，请重新进入兑换。");
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    return;
+  }
+
+  // 继续发当前记录的下一段媒体
+  const tip = await ctx.reply("📦 继续发送中…");
+  if (tip && tip.message_id) await registerAutoDelete(ctx.chat.id, tip.message_id);
+
+  const row = groupRows[recordIndexInGroup];
+  const result = await sendOneProductRowLimited(ctx, row, mediaOffset);
+
+  if (!result.done) {
+    const keyboard = new InlineKeyboard()
+      .text("✨👉 请点击继续发送", `dh_more:${encodeURIComponent(keyword)}:${recordOffset}:${recordIndexInGroup}:${result.nextMediaOffset}`)
+      .row()
+      .text("💎 加入会员（新春特价）", "go_v")
+      .row()
+      .text("↩️ 返回兑换", "go_dh");
+
+    const sent = await ctx.reply("已发送部分内容，点击继续发送下一段👇", { reply_markup: keyboard });
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    return;
+  }
+
+  // 当前记录发完，继续发送该组后续记录（从下一条开始）
+  const nextRecordIndex = recordIndexInGroup + 1;
+  let currentIndex = nextRecordIndex;
+
+  while (currentIndex < groupRows.length) {
+    const r = groupRows[currentIndex];
+    const rr = await sendOneProductRowLimited(ctx, r, 0);
+    if (!rr.done) {
+      const keyboard = new InlineKeyboard()
+        .text("✨👉 请点击继续发送", `dh_more:${encodeURIComponent(keyword)}:${recordOffset}:${currentIndex}:${rr.nextMediaOffset}`)
+        .row()
+        .text("💎 加入会员（新春特价）", "go_v")
+        .row()
+        .text("↩️ 返回兑换", "go_dh");
+
+      const sent = await ctx.reply("已发送部分内容，点击继续发送下一段👇", { reply_markup: keyboard });
+      if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+      return;
+    }
+    currentIndex += 1;
+  }
+
+  // 该组发完，提示下一组
+  const nextRecordOffset = recordOffset + groupRows.length;
+  const finishedAll = nextRecordOffset >= rows.length;
+
+  if (finishedAll) {
+    const keyboard = new InlineKeyboard()
+      .text("💎 加入会员（新春特价）", "go_v")
+      .row()
+      .text("↩️ 返回兑换", "go_dh");
+
+    const sent = await ctx.reply("✅ 文件发送完毕（全部组已完成）。", { reply_markup: keyboard });
+    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    return;
+  }
+
+  const keyboard = new InlineKeyboard()
+    .text("✨👉 请点击继续发送", `dh_more_group:${encodeURIComponent(keyword)}:${nextRecordOffset}`)
+    .row()
+    .text("💎 加入会员（新春特价）", "go_v")
+    .row()
+    .text("↩️ 返回兑换", "go_dh");
+
+  const sent = await ctx.reply("已发送本组内容，点击继续发送下一组👇", { reply_markup: keyboard });
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+bot.callbackQuery(/^dh_more_group:(.+):(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  const keyword = decodeURIComponent(ctx.match[1]);
+  const recordOffset = Number(ctx.match[2]);
+  await sendDhRecordsChunk(ctx, keyword, recordOffset, 0);
+});
+
+bot.callbackQuery("admin_back", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await clearUserState(ctx.from.id);
+  await showAdmin(ctx);
+});
+
+bot.callbackQuery("admin_p", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showP(ctx);
+});
+
+bot.callbackQuery("admin_tickets", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendTicketPage(ctx, 0);
+});
+
+bot.callbackQuery(/^admin_tickets_page:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendTicketPage(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^ticket_del1:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  if (!(await requireAdmin(ctx))) return;
+
+  const id = Number(ctx.match[1]);
+  const keyboard = new InlineKeyboard()
+    .text("确认删除", `ticket_del2:${id}`)
+    .row()
+    .text("返回", "admin_tickets");
+
+  const sent = await ctx.reply(`⚠️ 是否删除工单 #${id}？`, { reply_markup: keyboard });
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+bot.callbackQuery(/^ticket_del2:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  if (!(await requireAdmin(ctx))) return;
+
+  const id = Number(ctx.match[1]);
+  const keyboard = new InlineKeyboard()
+    .text("真的确定删除", `ticket_del3:${id}`)
+    .row()
+    .text("返回", "admin_tickets");
+
+  const sent = await ctx.reply(`❗最后确认：真的要删除工单 #${id} 吗？`, { reply_markup: keyboard });
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+bot.callbackQuery(/^ticket_del3:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  if (!(await requireAdmin(ctx))) return;
+  const id = Number(ctx.match[1]);
+  await deleteTicketById(id);
+  const sent = await ctx.reply(`✅ 已删除工单 #${id}`);
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+  await sendTicketPage(ctx, 0);
+});
+
+bot.callbackQuery("admin_users", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendUsersPage(ctx, 0);
+});
+
+bot.callbackQuery(/^admin_users_page:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendUsersPage(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery(/^admin_user:(\d+)$/, async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await sendUserDetail(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery("admin_fileid", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  if (!(await requireAdmin(ctx))) return;
+
+  await setUserState(ctx.from.id, "admin_wait_fileid", "1");
+
+  const keyboard = new InlineKeyboard().text("返回", "admin_back");
+  const sent = await ctx.reply("请发送媒体（图片/视频/文件等）以获取 file_id：", { reply_markup: keyboard });
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
+bot.callbackQuery("p_add", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  if (!(await requireAdmin(ctx))) return;
+  await setUserState(ctx.from.id, "p_wait_keyword", "1");
+  const sent = await ctx.reply("请输入关键词（例如：1）：");
+  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+});
+
 bot.callbackQuery("p_publish", async (ctx) => {
   try { await ctx.answerCallbackQuery(); } catch (error) {}
   if (!(await requireAdmin(ctx))) return;
@@ -1285,7 +1567,6 @@ bot.callbackQuery("p_publish", async (ctx) => {
   }
 
   const keyword = st.value;
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN;");
@@ -1369,67 +1650,16 @@ bot.callbackQuery(/^p_del3:(.+)$/, async (ctx) => {
   await showP(ctx);
 });
 
-// ---------- /c /cz ----------
-bot.command("c", async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
-  await clearUserState(ctx.from.id);
-  const sent = await ctx.reply("✅ 已取消你当前的验证/上架等待状态。");
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
+/**
+ * =========================================================
+ * 兜底 on(message)：除命令外任何消息进入 /dh（并优先处理状态）
+ * =========================================================
+ */
 
-bot.command("cz", async (ctx) => {
-  if (!(await requireAdmin(ctx))) return;
-
-  const adminId = Number(ctx.from.id);
-  const todayKey = getDateKeyInTimezone(new Date(), TIMEZONE);
-
-  const client = await pool.connect();
-  try {
-    await clearUserState(adminId);
-
-    await client.query(
-      `
-      INSERT INTO dh_quota (user_id, date_key, used_count, next_allowed_at, updated_at)
-      VALUES ($1, $2, 0, NULL, NOW())
-      ON CONFLICT (user_id)
-      DO UPDATE SET date_key = EXCLUDED.date_key, used_count = 0, next_allowed_at = NULL, updated_at = NOW();
-      `,
-      [adminId, todayKey]
-    );
-
-    await client.query(
-      `UPDATE bot_users SET first_seen_date = $2, last_seen_at = NOW() WHERE user_id = $1;`,
-      [adminId, todayKey]
-    );
-  } finally {
-    client.release();
-  }
-
-  const sent = await ctx.reply("♻️ 已重置你的测试状态：冷却与次数清零，并视为“新用户当天”。");
-  if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
-});
-
-// ---------- /admin 命令 ----------
-bot.command("admin", async (ctx) => {
-  await showAdmin(ctx);
-});
-
-// ---------- /start 回调 ----------
-bot.callbackQuery("go_dh", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await showDh(ctx);
-});
-
-bot.callbackQuery("go_v", async (ctx) => {
-  try { await ctx.answerCallbackQuery(); } catch (error) {}
-  await showVip(ctx);
-});
-
-// ---------- 非命令消息进入 /dh（并优先处理状态） ----------
 bot.on("message", async (ctx) => {
   if (!ctx.from) return;
 
-  // 命令不在这里处理
+  // 命令消息不走这里
   if (ctx.message && typeof ctx.message.text === "string") {
     const t = ctx.message.text.trim();
     if (t.startsWith("/")) return;
@@ -1437,6 +1667,7 @@ bot.on("message", async (ctx) => {
 
   const st = await getUserState(ctx.from.id);
 
+  // /v 订单号输入
   if (st.key === "v_wait_order") {
     if (ctx.message && typeof ctx.message.text === "string") {
       await handleVipOrderInput(ctx);
@@ -1446,17 +1677,45 @@ bot.on("message", async (ctx) => {
     return;
   }
 
-  if (isAdmin(ctx)) {
-    if (st.key === "p_wait_keyword" && ctx.message && typeof ctx.message.text === "string") {
-      await handlePKeywordInput(ctx);
+  // /p keyword 输入
+  if (isAdmin(ctx) && st.key === "p_wait_keyword") {
+    if (ctx.message && typeof ctx.message.text === "string") {
+      const keyword = String(ctx.message.text || "").trim();
+      if (!keyword) {
+        await ctx.reply("关键词不能为空，请重新输入。");
+        return;
+      }
+      await setUserState(ctx.from.id, "p_wait_content", keyword);
+
+      const client = await pool.connect();
+      try {
+        await client.query(`DELETE FROM p_buffer WHERE admin_id = $1 AND keyword = $2;`, [Number(ctx.from.id), keyword]);
+      } finally {
+        client.release();
+      }
+
+      const keyboard = new InlineKeyboard()
+        .text("返回", "admin_p")
+        .row()
+        .text("✅ 完成上架", "p_publish");
+
+      await ctx.reply(
+        `关键词已设置为：${keyword}\n\n请开始发送内容（支持任何格式，逐条记录）。\n发送完后点击 ✅ 完成上架。`,
+        { reply_markup: keyboard }
+      );
       return;
     }
-    if (st.key === "p_wait_content") {
-      await handlePContentInput(ctx);
-      return;
-    }
+    await ctx.reply("请输入关键词文本。");
+    return;
   }
 
+  // /p content 输入
+  if (isAdmin(ctx) && st.key === "p_wait_content") {
+    await handlePContentInput(ctx);
+    return;
+  }
+
+  // admin file id
   if (isAdmin(ctx) && st.key === "admin_wait_fileid") {
     const fileId = extractFirstFileIdFromMessage(ctx.message);
     if (!fileId) {
@@ -1464,50 +1723,75 @@ bot.on("message", async (ctx) => {
       return;
     }
     await clearUserState(ctx.from.id);
-    const sent = await ctx.reply(`🆔 file_id：${fileId}`);
-    if (sent && sent.message_id) await registerAutoDelete(ctx.chat.id, sent.message_id);
+    await ctx.reply(`🆔 file_id：${fileId}`);
     await showAdmin(ctx);
     return;
   }
 
+  // 其它进入 /dh
   await showDh(ctx);
 });
 
-// ---------- 中间件：初始化、先删过期、首次启动工单 ----------
-bot.use(async (ctx, next) => {
-  await ensureTables();
-  await gcExpiredMessages(ctx);
+/**
+ * =========================================================
+ * /start 按钮触发与 /v 入口按钮
+ * =========================================================
+ */
 
-  if (ctx.from) {
-    const info = await upsertBotUser(ctx.from);
-    if (info.isFirstSeenEver) {
-      const statusText = "用户状态：首次启动";
-
-      try {
-        await insertTicketRow({
-          user_id: ctx.from.id,
-          username: ctx.from.username ? String(ctx.from.username) : null,
-          first_name: ctx.from.first_name ? String(ctx.from.first_name) : null,
-          review_type: "first_open",
-          file_id: null,
-          order_number: null,
-          status: statusText
-        });
-      } catch (error) {}
-
-      try {
-        await ctx.api.sendMessage(
-          ADMIN_ID,
-          buildAdminTicketMessage(ctx.from, "首次启动", statusText)
-        );
-      } catch (error) {}
-    }
-  }
-
-  await next();
+bot.callbackQuery("go_start", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showStart(ctx);
 });
 
-// ---------- Vercel handler ----------
+bot.callbackQuery("go_v", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showVip(ctx);
+});
+
+bot.callbackQuery("go_dh", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await showDh(ctx);
+});
+
+/**
+ * =========================================================
+ * /v “我已付款”
+ * =========================================================
+ */
+
+bot.callbackQuery("v_paid", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  const sent1 = await ctx.replyWithPhoto(FILE_ID_ORDER, { caption: ORDER_GUIDE_TEXT });
+  if (sent1 && sent1.message_id) await registerAutoDelete(ctx.chat.id, sent1.message_id);
+  await setUserState(ctx.from.id, "v_wait_order", "0");
+  const sent2 = await ctx.reply("请发送订单号：");
+  if (sent2 && sent2.message_id) await registerAutoDelete(ctx.chat.id, sent2.message_id);
+});
+
+/**
+ * =========================================================
+ * /admin 返回
+ * =========================================================
+ */
+
+bot.callbackQuery("admin_back", async (ctx) => {
+  try { await ctx.answerCallbackQuery(); } catch (error) {}
+  await clearUserState(ctx.from.id);
+  await showAdmin(ctx);
+});
+
+/**
+ * =========================================================
+ * /start deep link start=dh 已在 command start 处理
+ * =========================================================
+ */
+
+/**
+ * =========================================================
+ * Vercel handler
+ * =========================================================
+ */
+
 const handler = webhookCallback(bot, "http");
 
 module.exports = async (req, res) => {
