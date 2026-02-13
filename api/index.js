@@ -1,7 +1,6 @@
 const { Bot, InlineKeyboard, Keyboard } = require("grammy");
 const { Pool } = require("pg");
 
-// --- 环境变量 ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
@@ -17,10 +16,8 @@ if (!BOT_TOKEN || !DATABASE_URL) {
 const bot = new Bot(BOT_TOKEN);
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-// 简单的北京时间和 date_key（不依赖 luxon）
 function nowInChina() {
   const now = new Date();
-  // 强制用 +8 小时简单处理（对你当前需求足够）
   const utc = now.getTime() + now.getTimezoneOffset() * 60000;
   return new Date(utc + 8 * 3600000);
 }
@@ -31,11 +28,9 @@ function getDateKey(d = nowInChina()) {
   return `${y}-${m}-${day}`;
 }
 
-// 记录管理员状态（简单内存 FSM）
-const adminState = new Map(); // key: adminId, value: { mode, data }
-
-function isAdmin(userId) {
-  return ADMIN_IDS.includes(Number(userId));
+const adminState = new Map();
+function isAdmin(id) {
+  return ADMIN_IDS.includes(Number(id));
 }
 
 // /start
@@ -54,7 +49,7 @@ bot.command("start", async (ctx) => {
   await ctx.reply(text, { reply_markup: kb });
 });
 
-// 点击「加入会员（新春特价）」 -> VIP 页面
+// 加入会员
 bot.callbackQuery("start_join_vip", async (ctx) => {
   const text =
     "🎉 喜迎新春（特价 VIP 专区）\n\n" +
@@ -72,7 +67,7 @@ bot.callbackQuery("start_join_vip", async (ctx) => {
   });
 });
 
-// /v 命令同样进入 VIP 页面
+// /v
 bot.command("v", async (ctx) => {
   const text =
     "🎉 喜迎新春（特价 VIP 专区）\n\n" +
@@ -88,7 +83,7 @@ bot.command("v", async (ctx) => {
   await ctx.reply(text, { reply_markup: kb });
 });
 
-// 点击「我已付款，开始验证」 -> 让用户输入订单号
+// 点击“我已付款，开始验证”
 bot.callbackQuery("vip_paid", async (ctx) => {
   const userId = ctx.from.id;
   adminState.set(userId, { mode: "waiting_order_no", data: { retry: 0 } });
@@ -107,8 +102,7 @@ bot.callbackQuery("vip_paid", async (ctx) => {
   });
 });
 
-// 处理订单号输入（只实现核心逻辑：识别 20260 开头、发送入群按钮）
-// 详细的 VIP 入群 + 工单逻辑后面再补充（先保证不报错、按钮有反应）
+// 处理订单号
 bot.on("message:text", async (ctx, next) => {
   const userId = ctx.from.id;
   const st = adminState.get(userId);
@@ -116,7 +110,7 @@ bot.on("message:text", async (ctx, next) => {
   if (!st || st.mode !== "waiting_order_no") return next();
 
   const orderNo = ctx.message.text.trim();
-  const isMatch = /^20260.+/.test(orderNo); // 内部逻辑，不提示给用户
+  const isMatch = /^20260.+/.test(orderNo);
 
   if (!isMatch) {
     st.data.retry = (st.data.retry || 0) + 1;
@@ -135,7 +129,6 @@ bot.on("message:text", async (ctx, next) => {
     }
   }
 
-  // 识别成功：清状态 + 发入群按钮
   adminState.delete(userId);
 
   const joinLink = "https://t.me/+495j5rWmApsxYzg9";
@@ -144,11 +137,9 @@ bot.on("message:text", async (ctx, next) => {
     "✅ 订单验证成功！\n\n欢迎加入会员群，解锁更多专属资源与服务：",
     { reply_markup: kb }
   );
-
-  // TODO: 这里以后再补充：写入 orders / tickets 表，发给管理员等
 });
 
-// 返回首页按钮
+// 返回首页
 bot.callbackQuery("back_to_start", async (ctx) => {
   await ctx.answerCallbackQuery();
   const kb = new InlineKeyboard()
@@ -158,7 +149,7 @@ bot.callbackQuery("back_to_start", async (ctx) => {
   await ctx.reply("已返回首页，请重新选择服务：", { reply_markup: kb });
 });
 
-// /admin 管理面板（简化版）
+// /admin
 bot.command("admin", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
 
@@ -176,31 +167,28 @@ bot.command("admin", async (ctx) => {
   });
 });
 
-// admin_p 按钮先只回一条文字，后面再对接你 Neon 的旧表
+// /p 和 /dh 先占位，后面对接你原来的表
 bot.callbackQuery("admin_p", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   await ctx.answerCallbackQuery();
   await ctx.reply("这里将显示 /p 商品列表（后面对接你原来的 Neon 数据表）。");
 });
 
-// /p 命令同样先占位
 bot.command("p", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   await ctx.reply("这里将显示 /p 商品列表（后面对接你原来的 Neon 数据表）。");
 });
 
-// /dh 命令占位（后面接你原来的表）
 bot.command("dh", async (ctx) => {
   await ctx.reply("这里将加载你原来 /dh 的关键词和内容（待对接 Neon 表）。");
 });
 
-// 点击首页“兑换资源”
 bot.callbackQuery("start_dh", async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.reply("这里将加载你原来 /dh 的关键词和内容（待对接 Neon 表）。");
 });
 
-// /c 取消当前管理员状态
+// /c 取消状态
 bot.command("c", async (ctx) => {
   const userId = ctx.from.id;
   if (!isAdmin(userId)) return;
@@ -208,7 +196,6 @@ bot.command("c", async (ctx) => {
   await ctx.reply("已清除当前操作状态。");
 });
 
-// Vercel 入口（Webhook）
 module.exports = async (req, res) => {
   if (req.method === "POST") {
     try {
@@ -218,7 +205,6 @@ module.exports = async (req, res) => {
     }
     res.status(200).json({ ok: true });
   } else {
-    // 健康检查
     res.status(200).send("OK");
   }
 };
