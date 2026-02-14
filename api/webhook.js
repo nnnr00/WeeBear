@@ -5,8 +5,8 @@
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 const FILE_IDS = {
-  VIP_PROMO: '',
-  PAYMENT_TUTORIAL: '',
+  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJDmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',
+  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKDmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',
   WELCOME_IMAGE: ''
 };
 
