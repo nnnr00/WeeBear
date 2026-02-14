@@ -1,27 +1,97 @@
 // api/webhook.js
 // ============== 配置区 ==============
 const BOT_TOKEN = process.env.YOUR_BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
 
-// ============== FILE IDS 配置（在这里填入你的File ID） ==============
+// ============== FILE IDS 配置 ==============
 const FILE_IDS = {
-  VIP_PROMO: '',           // VIP宣传图 file_id
-  PAYMENT_TUTORIAL: '',    // 支付教程图 file_id  
-  WELCOME_IMAGE: ''        // 欢迎图 file_id
+  VIP_PROMO: '',
+  PAYMENT_TUTORIAL: '',
+  WELCOME_IMAGE: ''
 };
 
 const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
 
-// ============== 内存存储 ==============
-global.memoryStore = global.memoryStore || {
-  users: {},
-  states: {},
-  tickets: [],
-  products: [],
-  productContents: []
-};
+// ============== Neon 数据库连接 ==============
+const { Pool } = require('pg');
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-const store = global.memoryStore;
+async function query(text, params) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(text, params);
+    return result;
+  } finally {
+    client.release();
+  }
+}
+
+// ============== 初始化数据库表 ==============
+async function initDB() {
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username VARCHAR(255),
+        first_name VARCHAR(255),
+        first_seen_date VARCHAR(20),
+        last_seen_date VARCHAR(20),
+        date_key VARCHAR(20),
+        daily_count INT DEFAULT 0,
+        cooldown_index INT DEFAULT 0,
+        last_redeem_time BIGINT DEFAULT 0,
+        is_disabled BOOLEAN DEFAULT FALSE
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS user_states (
+        user_id BIGINT PRIMARY KEY,
+        state VARCHAR(100),
+        data TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS tickets (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT,
+        username VARCHAR(255),
+        first_name VARCHAR(255),
+        order_number VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        keyword VARCHAR(255) UNIQUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS product_contents (
+        id SERIAL PRIMARY KEY,
+        product_id INT REFERENCES products(id) ON DELETE CASCADE,
+        content_type VARCHAR(50),
+        content TEXT,
+        file_id VARCHAR(500),
+        sort_order INT DEFAULT 0
+      )
+    `);
+
+    console.log('Database initialized');
+  } catch (e) {
+    console.error('DB Init Error:', e.message);
+  }
+}
 
 // ============== 工具函数 ==============
 function isAdmin(userId) {
@@ -35,7 +105,7 @@ function getBeijingDateKey() {
 }
 
 function formatBeijingTime(date) {
-  const d = date || new Date();
+  const d = date ? new Date(date) : new Date();
   const bj = new Date(d.getTime() + 8 * 60 * 60 * 1000);
   return bj.toISOString().replace('T', ' ').substring(0, 19);
 }
@@ -49,98 +119,102 @@ async function sendTelegram(method, params) {
       body: JSON.stringify(params)
     });
     const data = await res.json();
-    if (!data.ok) {
-      console.log(`Telegram ${method} failed:`, data.description);
-    }
+    if (!data.ok) console.log(`TG ${method} failed:`, data.description);
     return data;
   } catch (e) {
-    console.error(`Telegram ${method} error:`, e.message);
-    return { ok: false, error: e.message };
+    console.error(`TG ${method} error:`, e.message);
+    return { ok: false };
   }
 }
 
-function setState(userId, state, data = {}) {
-  store.states[userId] = { state, data, time: Date.now() };
+async function setState(userId, state, data = {}) {
+  await query(
+    `INSERT INTO user_states (user_id, state, data, updated_at) 
+     VALUES ($1, $2, $3, NOW()) 
+     ON CONFLICT (user_id) DO UPDATE SET state = $2, data = $3, updated_at = NOW()`,
+    [userId, state, JSON.stringify(data)]
+  );
 }
 
-function getState(userId) {
-  return store.states[userId] || { state: null, data: {} };
+async function getState(userId) {
+  const result = await query('SELECT state, data FROM user_states WHERE user_id = $1', [userId]);
+  if (result.rows.length > 0) {
+    return { state: result.rows[0].state, data: JSON.parse(result.rows[0].data || '{}') };
+  }
+  return { state: null, data: {} };
 }
 
-function clearState(userId) {
-  delete store.states[userId];
+async function clearState(userId) {
+  await query('DELETE FROM user_states WHERE user_id = $1', [userId]);
 }
 
-function getOrCreateUser(userId, username, firstName) {
+async function getOrCreateUser(userId, username, firstName) {
   const dateKey = getBeijingDateKey();
-  let user = store.users[userId];
+  const result = await query('SELECT * FROM users WHERE user_id = $1', [userId]);
 
-  if (!user) {
-    user = {
-      userId,
-      username: username || '',
-      firstName: firstName || '',
-      firstSeenDate: dateKey,
-      lastSeenDate: dateKey,
-      dateKey,
-      dailyCount: 0,
-      cooldownIndex: 0,
-      lastRedeemTime: 0,
-      isDisabled: false
-    };
-    store.users[userId] = user;
-    return { ...user, isNew: true };
+  if (result.rows.length === 0) {
+    await query(
+      `INSERT INTO users (user_id, username, first_name, first_seen_date, last_seen_date, date_key, daily_count, cooldown_index, last_redeem_time)
+       VALUES ($1, $2, $3, $4, $4, $4, 0, 0, 0)`,
+      [userId, username || '', firstName || '', dateKey]
+    );
+    return { userId, username, firstName, firstSeenDate: dateKey, dateKey, dailyCount: 0, cooldownIndex: 0, lastRedeemTime: 0, isNew: true };
   }
 
-  // 日期变化，重置每日数据
-  if (user.dateKey !== dateKey) {
-    user.dateKey = dateKey;
-    user.dailyCount = 0;
-    user.cooldownIndex = 0;
-    user.lastSeenDate = dateKey;
+  const user = result.rows[0];
+
+  // 日期变化重置
+  if (user.date_key !== dateKey) {
+    await query(
+      `UPDATE users SET date_key = $1, daily_count = 0, cooldown_index = 0, last_seen_date = $1, username = $2, first_name = $3 WHERE user_id = $4`,
+      [dateKey, username || user.username, firstName || user.first_name, userId]
+    );
+    return { ...user, dateKey, dailyCount: 0, cooldownIndex: 0, isNew: user.first_seen_date === dateKey };
   }
 
-  user.username = username || user.username;
-  user.firstName = firstName || user.firstName;
-  user.lastSeenDate = dateKey;
-  store.users[userId] = user;
+  await query(
+    `UPDATE users SET last_seen_date = $1, username = $2, first_name = $3 WHERE user_id = $4`,
+    [dateKey, username || user.username, firstName || user.first_name, userId]
+  );
 
-  return { ...user, isNew: user.firstSeenDate === dateKey };
+  return {
+    userId: user.user_id,
+    username: user.username,
+    firstName: user.first_name,
+    firstSeenDate: user.first_seen_date,
+    dateKey: user.date_key,
+    dailyCount: user.daily_count,
+    cooldownIndex: user.cooldown_index,
+    lastRedeemTime: parseInt(user.last_redeem_time) || 0,
+    isDisabled: user.is_disabled,
+    isNew: user.first_seen_date === dateKey
+  };
 }
 
 // ============== 主处理器 ==============
 module.exports = async (req, res) => {
-  // GET 请求 - 状态检查和设置 webhook
   if (req.method === 'GET') {
     if (req.query.setWebhook) {
-      const host = req.headers.host;
-      const webhookUrl = `https://${host}/api/webhook`;
+      const webhookUrl = `https://${req.headers.host}/api/webhook`;
       const result = await sendTelegram('setWebhook', { url: webhookUrl });
       return res.status(200).json({ webhook: webhookUrl, result });
     }
-    return res.status(200).json({ 
-      status: 'Bot is running', 
-      token: BOT_TOKEN ? 'Set' : 'NOT SET', 
-      admins: ADMIN_IDS,
-      products: store.products.length,
-      users: Object.keys(store.users).length
-    });
+    if (req.query.init) {
+      await initDB();
+      return res.status(200).json({ message: 'Database initialized' });
+    }
+    return res.status(200).json({ status: 'Running', token: BOT_TOKEN ? 'Set' : 'NOT SET', admins: ADMIN_IDS });
   }
 
-  if (req.method !== 'POST') {
-    return res.status(200).send('OK');
-  }
-
-  const update = req.body;
+  if (req.method !== 'POST') return res.status(200).send('OK');
 
   try {
-    if (update.message) {
-      await handleMessage(update.message);
-    } else if (update.callback_query) {
-      await handleCallback(update.callback_query);
-    }
+    await initDB();
+    const update = req.body;
+    if (update.message) await handleMessage(update.message);
+    else if (update.callback_query) await handleCallback(update.callback_query);
   } catch (e) {
-    console.error('Handler Error:', e.message);
+    console.error('Error:', e.message);
   }
 
   res.status(200).send('OK');
@@ -154,47 +228,43 @@ async function handleMessage(msg) {
   const firstName = msg.from.first_name;
   const text = msg.text || '';
 
-  const userState = getState(userId);
+  const userState = await getState(userId);
 
-  // ===== 管理员命令 =====
+  // 管理员命令
   if (text === '/admin' && isAdmin(userId)) {
-    clearState(userId);
+    await clearState(userId);
     return showAdminPanel(chatId);
   }
 
   if (text === '/c' && isAdmin(userId)) {
-    clearState(userId);
+    await clearState(userId);
     return sendTelegram('sendMessage', { chat_id: chatId, text: '✅ 已取消当前操作' });
   }
 
   if (text === '/cz' && isAdmin(userId)) {
     const dateKey = getBeijingDateKey();
-    store.users[userId] = {
-      ...store.users[userId],
-      dailyCount: 0,
-      cooldownIndex: 0,
-      lastRedeemTime: 0,
-      firstSeenDate: dateKey,
-      dateKey
-    };
-    clearState(userId);
-    return sendTelegram('sendMessage', { chat_id: chatId, text: '✅ 已重置为新用户状态（当天免费3次）' });
+    await query(
+      `UPDATE users SET daily_count = 0, cooldown_index = 0, last_redeem_time = 0, first_seen_date = $1, date_key = $1 WHERE user_id = $2`,
+      [dateKey, userId]
+    );
+    await clearState(userId);
+    return sendTelegram('sendMessage', { chat_id: chatId, text: '✅ 已重置为新用户状态' });
   }
 
   if (text === '/p' && isAdmin(userId)) {
-    clearState(userId);
+    await clearState(userId);
     return showProductManagement(chatId);
   }
 
-  // ===== 普通命令 =====
+  // 普通命令
   if (text === '/start' || text === '/start ') {
-    clearState(userId);
-    getOrCreateUser(userId, username, firstName);
+    await clearState(userId);
+    await getOrCreateUser(userId, username, firstName);
     return showWelcome(chatId);
   }
 
   if (text === '/start dh' || text === '/dh') {
-    clearState(userId);
+    await clearState(userId);
     return showRedeem(chatId, userId, username, firstName);
   }
 
@@ -202,18 +272,18 @@ async function handleMessage(msg) {
     return showVIP(chatId);
   }
 
-  // ===== 状态机处理 =====
+  // 状态机
   if (userState.state) {
     return handleStateInput(chatId, userId, username, firstName, msg, userState);
   }
 }
 
-// ============== 状态输入处理 ==============
+// ============== 状态处理 ==============
 async function handleStateInput(chatId, userId, username, firstName, msg, userState) {
   const text = msg.text || '';
   const { state, data } = userState;
 
-  // 管理员：获取 File ID
+  // 获取 File ID
   if (state === 'waiting_file_id' && isAdmin(userId)) {
     let fileId = null;
     if (msg.photo) fileId = msg.photo[msg.photo.length - 1].file_id;
@@ -225,206 +295,161 @@ async function handleStateInput(chatId, userId, username, firstName, msg, userSt
     else if (msg.animation) fileId = msg.animation.file_id;
 
     if (fileId) {
-      clearState(userId);
+      await clearState(userId);
       return sendTelegram('sendMessage', {
         chat_id: chatId,
-        text: `📎 File ID:\n\n<code>${fileId}</code>\n\n点击可复制`,
+        text: `📎 File ID:\n\n<code>${fileId}</code>`,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '↩️ 返回管理面板', callback_data: 'admin' }]] }
       });
-    } else {
-      return sendTelegram('sendMessage', { 
-        chat_id: chatId, 
-        text: '❌ 请发送图片、文件、视频等媒体内容',
-        reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'admin' }]] }
-      });
     }
+    return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 请发送媒体文件' });
   }
 
-  // 管理员：输入关键词
+  // 输入关键词
   if (state === 'waiting_keyword' && isAdmin(userId)) {
     const keyword = text.trim();
-    if (!keyword) {
-      return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 关键词不能为空，请重新输入：' });
+    if (!keyword) return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 关键词不能为空' });
+
+    const existing = await query('SELECT id FROM products WHERE keyword = $1', [keyword]);
+    if (existing.rows.length > 0) {
+      return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 关键词已存在' });
     }
 
-    const existing = store.products.find(p => p.keyword === keyword);
-    if (existing) {
-      return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 该关键词已存在，请输入其他关键词：' });
-    }
-
-    const productId = Date.now();
-    store.products.push({ id: productId, keyword, createdAt: Date.now() });
-    setState(userId, 'waiting_product_content', { productId, keyword });
+    const result = await query('INSERT INTO products (keyword) VALUES ($1) RETURNING id', [keyword]);
+    const productId = result.rows[0].id;
+    await setState(userId, 'waiting_product_content', { productId, keyword });
 
     return sendTelegram('sendMessage', {
       chat_id: chatId,
-      text: `✅ 关键词「${keyword}」已创建\n\n📝 请发送内容（支持文字、图片、文件、视频等）\n\n可连续发送多条，完成后点击下方按钮`,
+      text: `✅ 关键词「${keyword}」已创建\n\n📝 请发送内容（支持任意格式）`,
       reply_markup: { inline_keyboard: [[{ text: '✅ 完成上架', callback_data: `finish_product_${productId}` }]] }
     });
   }
 
-  // 管理员：添加商品内容
+  // 添加商品内容
   if (state === 'waiting_product_content' && isAdmin(userId)) {
     const { productId, keyword } = data;
     let contentType = 'text';
     let content = text;
     let fileId = null;
 
-    if (msg.photo) {
-      contentType = 'photo';
-      fileId = msg.photo[msg.photo.length - 1].file_id;
-      content = msg.caption || '';
-    } else if (msg.document) {
-      contentType = 'document';
-      fileId = msg.document.file_id;
-      content = msg.caption || '';
-    } else if (msg.video) {
-      contentType = 'video';
-      fileId = msg.video.file_id;
-      content = msg.caption || '';
-    } else if (msg.audio) {
-      contentType = 'audio';
-      fileId = msg.audio.file_id;
-      content = msg.caption || '';
-    } else if (msg.animation) {
-      contentType = 'animation';
-      fileId = msg.animation.file_id;
-      content = msg.caption || '';
-    } else if (msg.forward_origin || msg.forward_from || msg.forward_from_chat) {
-      contentType = 'forward_text';
-    }
+    if (msg.photo) { contentType = 'photo'; fileId = msg.photo[msg.photo.length - 1].file_id; content = msg.caption || ''; }
+    else if (msg.document) { contentType = 'document'; fileId = msg.document.file_id; content = msg.caption || ''; }
+    else if (msg.video) { contentType = 'video'; fileId = msg.video.file_id; content = msg.caption || ''; }
+    else if (msg.audio) { contentType = 'audio'; fileId = msg.audio.file_id; content = msg.caption || ''; }
+    else if (msg.animation) { contentType = 'animation'; fileId = msg.animation.file_id; content = msg.caption || ''; }
 
-    const existingContents = store.productContents.filter(c => c.productId === productId);
-    const sortOrder = existingContents.length + 1;
+    const countResult = await query('SELECT COUNT(*) as cnt FROM product_contents WHERE product_id = $1', [productId]);
+    const sortOrder = parseInt(countResult.rows[0].cnt) + 1;
 
-    store.productContents.push({
-      id: Date.now(),
-      productId,
-      contentType,
-      content: content || '',
-      fileId,
-      sortOrder
-    });
+    await query(
+      'INSERT INTO product_contents (product_id, content_type, content, file_id, sort_order) VALUES ($1, $2, $3, $4, $5)',
+      [productId, contentType, content || '', fileId, sortOrder]
+    );
 
     return sendTelegram('sendMessage', {
       chat_id: chatId,
-      text: `✅ 已添加第 ${sortOrder} 条内容\n\n继续发送更多内容，或点击完成`,
+      text: `✅ 已添加第 ${sortOrder} 条内容`,
       reply_markup: { inline_keyboard: [[{ text: '✅ 完成上架', callback_data: `finish_product_${productId}` }]] }
     });
   }
 
-  // 用户：输入订单号
+  // 输入订单号
   if (state === 'waiting_order') {
     const orderNumber = text.trim();
     const failCount = data.failCount || 0;
 
-    // 私密验证逻辑
     if (orderNumber.startsWith('20260')) {
-      // 创建工单
-      store.tickets.push({
-        id: Date.now(),
-        userId,
-        username: username || '',
-        firstName: firstName || '',
-        orderNumber,
-        createdAt: Date.now()
-      });
+      await query(
+        'INSERT INTO tickets (user_id, username, first_name, order_number) VALUES ($1, $2, $3, $4)',
+        [userId, username || '', firstName || '', orderNumber]
+      );
 
-      // 通知所有管理员
       for (const adminId of ADMIN_IDS) {
         await sendTelegram('sendMessage', {
           chat_id: adminId,
-          text: `🎫 新工单通知\n\n👤 姓名：${firstName || '未知'}\n👤 用户名：@${username || '无'}\n🆔 用户ID：${userId}\n📝 订单号：${orderNumber}\n⏰ 时间：${formatBeijingTime(new Date())}`
+          text: `🎫 新工单\n\n👤 ${firstName || '未知'}\n👤 @${username || '无'}\n🆔 ${userId}\n📝 ${orderNumber}\n⏰ ${formatBeijingTime(new Date())}`
         });
       }
 
-      clearState(userId);
+      await clearState(userId);
       return sendTelegram('sendMessage', {
         chat_id: chatId,
-        text: '🎉 验证成功！\n\n欢迎加入VIP会员大家庭',
-        reply_markup: { inline_keyboard: [[{ text: '🎉 加入会员群', url: VIP_GROUP_LINK }]] }
+        text: '🎉 验证成功！欢迎加入VIP',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🎉 加入会员群', url: VIP_GROUP_LINK }],
+            [{ text: '🎁 免费兑换', callback_data: 'redeem' }]
+          ]
+        }
       });
     } else {
-      // 验证失败
       if (failCount >= 1) {
-        clearState(userId);
-        await sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 验证失败次数过多，请稍后重试' });
+        await clearState(userId);
+        await sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 验证失败，请重新开始' });
         return showWelcome(chatId);
-      } else {
-        setState(userId, 'waiting_order', { failCount: failCount + 1 });
-        return sendTelegram('sendMessage', { 
-          chat_id: chatId, 
-          text: '❌ 订单号格式不正确，请检查后重新输入：',
-          reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'join_vip' }]] }
-        });
       }
+      await setState(userId, 'waiting_order', { failCount: failCount + 1 });
+      return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 订单号格式不正确，请重新输入' });
     }
   }
 }
 
 // ============== 回调处理 ==============
-async function handleCallback(query) {
-  const chatId = query.message.chat.id;
-  const userId = query.from.id;
-  const username = query.from.username;
-  const firstName = query.from.first_name;
-  const data = query.data;
-  const messageId = query.message.message_id;
+async function handleCallback(query_obj) {
+  const chatId = query_obj.message.chat.id;
+  const userId = query_obj.from.id;
+  const username = query_obj.from.username;
+  const firstName = query_obj.from.first_name;
+  const data = query_obj.data;
+  const messageId = query_obj.message.message_id;
 
-  await sendTelegram('answerCallbackQuery', { callback_query_id: query.id });
+  await sendTelegram('answerCallbackQuery', { callback_query_id: query_obj.id });
 
-  // ===== 管理员功能 =====
+  // ===== 管理员 =====
   if (data === 'admin' && isAdmin(userId)) {
-    clearState(userId);
+    await clearState(userId);
     return showAdminPanel(chatId, messageId);
   }
 
   if (data === 'get_file_id' && isAdmin(userId)) {
-    setState(userId, 'waiting_file_id');
+    await setState(userId, 'waiting_file_id');
     return sendTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text: '📷 请发送图片、视频、文件等\n\n我会返回对应的 File ID',
+      chat_id: chatId, message_id: messageId,
+      text: '📷 请发送图片、视频、文件等',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'admin' }]] }
     });
   }
 
   if (data === 'product_manage' && isAdmin(userId)) {
-    clearState(userId);
+    await clearState(userId);
     return showProductManagement(chatId, messageId);
   }
 
   if (data === 'add_product' && isAdmin(userId)) {
-    setState(userId, 'waiting_keyword');
+    await setState(userId, 'waiting_keyword');
     return sendTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text: '📝 请输入新商品的关键词：',
+      chat_id: chatId, message_id: messageId,
+      text: '📝 请输入关键词：',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 取消', callback_data: 'product_manage' }]] }
     });
   }
 
   if (data.startsWith('finish_product_') && isAdmin(userId)) {
-    const productId = parseInt(data.replace('finish_product_', ''));
-    const product = store.products.find(p => p.id === productId);
-    const contentCount = store.productContents.filter(c => c.productId === productId).length;
-    clearState(userId);
-    
+    await clearState(userId);
     return sendTelegram('sendMessage', {
       chat_id: chatId,
-      text: `✅ 商品上架完成！\n\n📦 关键词：${product?.keyword || '未知'}\n📄 内容数量：${contentCount} 条`,
+      text: '✅ 商品上架完成！',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 返回商品管理', callback_data: 'product_manage' }]] }
     });
   }
 
   if (data.startsWith('del_product_confirm_') && isAdmin(userId)) {
     const productId = parseInt(data.replace('del_product_confirm_', ''));
-    const product = store.products.find(p => p.id === productId);
     return sendTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text: `⚠️ 确定要删除商品「${product?.keyword || ''}」吗？\n\n此操作不可恢复！`,
+      chat_id: chatId, message_id: messageId,
+      text: '⚠️ 确定删除此商品？',
       reply_markup: {
         inline_keyboard: [
           [{ text: '✅ 确认删除', callback_data: `del_product_${productId}` }],
@@ -436,11 +461,11 @@ async function handleCallback(query) {
 
   if (data.startsWith('del_product_') && !data.includes('confirm') && isAdmin(userId)) {
     const productId = parseInt(data.replace('del_product_', ''));
-    store.products = store.products.filter(p => p.id !== productId);
-    store.productContents = store.productContents.filter(c => c.productId !== productId);
+    await query('DELETE FROM products WHERE id = $1', [productId]);
     return showProductManagement(chatId, messageId);
   }
 
+  // 工单管理
   if (data === 'ticket_manage' && isAdmin(userId)) {
     return showTickets(chatId, messageId, 1);
   }
@@ -455,12 +480,27 @@ async function handleCallback(query) {
     return showTicketDetail(chatId, messageId, ticketId);
   }
 
-  if (data.startsWith('del_ticket_') && isAdmin(userId)) {
-    const ticketId = parseInt(data.replace('del_ticket_', ''));
-    store.tickets = store.tickets.filter(t => t.id !== ticketId);
-    return showTickets(chatId, messageId, 1);
+  if (data.startsWith('del_ticket_confirm_') && isAdmin(userId)) {
+    const ticketId = parseInt(data.replace('del_ticket_confirm_', ''));
+    return sendTelegram('editMessageText', {
+      chat_id: chatId, message_id: messageId,
+      text: '⚠️ 确定删除此工单？',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ 确认删除', callback_data: `del_ticket_${ticketId}` }],
+          [{ text: '↩️ 取消', callback_data: `ticket_detail_${ticketId}` }]
+        ]
+      }
+    });
   }
 
+  if (data.startsWith('del_ticket_') && !data.includes('confirm') && isAdmin(userId)) {
+    const ticketId = parseInt(data.replace('del_ticket_', ''));
+    await query('DELETE FROM tickets WHERE id = $1', [ticketId]);
+    return showAdminPanel(chatId, messageId);
+  }
+
+  // 用户管理
   if (data === 'user_manage' && isAdmin(userId)) {
     return showUsers(chatId, messageId, 1);
   }
@@ -471,15 +511,13 @@ async function handleCallback(query) {
   }
 
   if (data.startsWith('user_detail_') && isAdmin(userId)) {
-    const targetUserId = parseInt(data.replace('user_detail_', ''));
+    const targetUserId = data.replace('user_detail_', '');
     return showUserDetail(chatId, messageId, targetUserId);
   }
 
   if (data.startsWith('toggle_user_') && isAdmin(userId)) {
-    const targetUserId = parseInt(data.replace('toggle_user_', ''));
-    if (store.users[targetUserId]) {
-      store.users[targetUserId].isDisabled = !store.users[targetUserId].isDisabled;
-    }
+    const targetUserId = data.replace('toggle_user_', '');
+    await query('UPDATE users SET is_disabled = NOT is_disabled WHERE user_id = $1', [targetUserId]);
     return showUserDetail(chatId, messageId, targetUserId);
   }
 
@@ -493,37 +531,35 @@ async function handleCallback(query) {
   }
 
   if (data === 'verify_payment') {
-    // 发送教程图片（如果有）
     if (FILE_IDS.PAYMENT_TUTORIAL) {
       await sendTelegram('sendPhoto', { chat_id: chatId, photo: FILE_IDS.PAYMENT_TUTORIAL });
     }
-
-    setState(userId, 'waiting_order', { failCount: 0 });
+    await setState(userId, 'waiting_order', { failCount: 0 });
     return sendTelegram('sendMessage', {
       chat_id: chatId,
-      text: '📋 **查找订单号步骤：**\n\n1️⃣ 打开支付应用（支付宝/微信）\n2️⃣ 点击「我的」\n3️⃣ 点击「账单」\n4️⃣ 找到本次付款记录\n5️⃣ 点击进入「账单详情」\n6️⃣ 点击「更多」\n7️⃣ 找到并复制「订单号」\n\n✏️ 请输入您的订单号：',
+      text: '📋 **查找订单号步骤：**\n\n1️⃣ 打开支付应用\n2️⃣ 点击「我的」\n3️⃣ 点击「账单」\n4️⃣ 找到付款记录\n5️⃣ 点击「账单详情」\n6️⃣ 点击「更多」\n7️⃣ 复制「订单号」\n\n✏️ 请输入订单号：',
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'join_vip' }]] }
     });
   }
 
   if (data === 'back_start') {
-    clearState(userId);
+    await clearState(userId);
     return showWelcome(chatId, messageId);
   }
 
-  // 兑换商品
-  if (data.startsWith('redeem_') && !data.startsWith('redeem_continue_')) {
-    const keyword = data.replace('redeem_', '');
+  // 兑换
+  if (data.startsWith('redeem_kw_')) {
+    const keyword = data.replace('redeem_kw_', '');
     return handleRedeemProduct(chatId, userId, username, firstName, keyword, messageId);
   }
 
-  if (data.startsWith('redeem_continue_')) {
-    const match = data.match(/redeem_continue_(.+)_(\d+)$/);
+  if (data.startsWith('redeem_page_')) {
+    const match = data.match(/redeem_page_(.+)_(\d+)$/);
     if (match) {
       const keyword = match[1];
       const page = parseInt(match[2]);
-      return sendProductContents(chatId, keyword, page);
+      return sendProductContents(chatId, userId, keyword, page, messageId);
     }
   }
 
@@ -531,7 +567,6 @@ async function handleCallback(query) {
     return showRedeem(chatId, userId, username, firstName, messageId);
   }
 
-  // 分页
   if (data.startsWith('products_page_') && isAdmin(userId)) {
     const page = parseInt(data.replace('products_page_', ''));
     return showProductManagement(chatId, messageId, page);
@@ -543,14 +578,9 @@ async function handleCallback(query) {
   }
 }
 
-// ============== 页面显示函数 ==============
+// ============== 页面函数 ==============
 async function showWelcome(chatId, messageId = null) {
-  const text = `🎊 **喜迎马年新春** 🐴\n\n` +
-    `🧧 新春资源免费获取 🧧\n\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `✨ 限时福利 · 等你来拿 ✨\n` +
-    `━━━━━━━━━━━━━━`;
-
+  const text = `🎊 **喜迎马年新春** 🐴\n\n🧧 新春资源免费获取 🧧\n\n━━━━━━━━━━━━━━\n✨ 限时福利 · 等你来拿 ✨\n━━━━━━━━━━━━━━`;
   const keyboard = {
     inline_keyboard: [
       [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
@@ -559,43 +589,16 @@ async function showWelcome(chatId, messageId = null) {
   };
 
   if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
-
-  // 如果有欢迎图片
   if (FILE_IDS.WELCOME_IMAGE) {
-    return sendTelegram('sendPhoto', { 
-      chat_id: chatId, 
-      photo: FILE_IDS.WELCOME_IMAGE, 
-      caption: text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    return sendTelegram('sendPhoto', { chat_id: chatId, photo: FILE_IDS.WELCOME_IMAGE, caption: text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
-
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: keyboard 
-  });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard });
 }
 
 async function showVIP(chatId, messageId = null) {
-  const text = `🎊 **喜迎新春（特价）**\n\n` +
-    `💎 **VIP会员特权说明：**\n\n` +
-    `✅ 专属中转通道\n` +
-    `✅ 优先审核入群\n` +
-    `✅ 7x24小时客服支持\n` +
-    `✅ 定期福利活动\n\n` +
-    `━━━━━━━━━━━━━━`;
-
+  const text = `🎊 **喜迎新春（特价）**\n\n💎 **VIP会员特权：**\n\n✅ 专属中转通道\n✅ 优先审核入群\n✅ 7x24小时客服\n✅ 定期福利活动\n\n━━━━━━━━━━━━━━`;
   const keyboard = {
     inline_keyboard: [
       [{ text: '✅ 我已付款，开始验证', callback_data: 'verify_payment' }],
@@ -603,67 +606,40 @@ async function showVIP(chatId, messageId = null) {
     ]
   };
 
-  // 如果有VIP宣传图
   if (FILE_IDS.VIP_PROMO) {
-    if (messageId) {
-      await sendTelegram('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
-    }
-    return sendTelegram('sendPhoto', { 
-      chat_id: chatId, 
-      photo: FILE_IDS.VIP_PROMO, 
-      caption: text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    if (messageId) await sendTelegram('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    return sendTelegram('sendPhoto', { chat_id: chatId, photo: FILE_IDS.VIP_PROMO, caption: text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
-
   if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: keyboard 
-  });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard });
 }
 
 async function showRedeem(chatId, userId, username, firstName, messageId = null) {
-  const user = getOrCreateUser(userId, username, firstName);
-  const { dailyCount, cooldownIndex, lastRedeemTime, firstSeenDate, dateKey } = user;
-  
-  const isNewUser = firstSeenDate === dateKey;
-  const freeLimit = isNewUser ? 3 : 2;
-  const cooldowns = [5, 15, 30, 50, 60, 60]; // 分钟
+  const user = await getOrCreateUser(userId, username, firstName);
+  const { dailyCount, cooldownIndex, lastRedeemTime, isNew } = user;
+
+  const freeLimit = isNew ? 3 : 2;
+  const cooldowns = [5, 15, 30, 50, 60, 60];
   const maxDaily = 6;
 
-  // 检查每日上限
   if (dailyCount >= maxDaily) {
-    const text = `⏰ 今日兑换次数已用完\n\n🌙 明天再来吧～\n\n💡 升级VIP会员可无限兑换`;
+    const text = `⏰ 今日兑换次数已用完\n\n🌙 明天再来吧～`;
     const keyboard = {
       inline_keyboard: [
         [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
         [{ text: '↩️ 返回首页', callback_data: 'back_start' }]
       ]
     };
-    if (messageId) {
-      return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: keyboard });
-    }
+    if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: keyboard });
     return sendTelegram('sendMessage', { chat_id: chatId, text, reply_markup: keyboard });
   }
 
-  // 免费次数内，直接显示
   if (dailyCount < freeLimit) {
     return showRedeemPage(chatId, messageId, 1);
   }
 
-  // 检查冷却时间
   const now = Date.now();
   const cdIndex = Math.min(cooldownIndex, cooldowns.length - 1);
   const cdTime = cooldowns[cdIndex] * 60 * 1000;
@@ -673,55 +649,34 @@ async function showRedeem(chatId, userId, username, firstName, messageId = null)
     const remaining = Math.ceil((cdTime - elapsed) / 1000);
     const mins = Math.floor(remaining / 60);
     const secs = remaining % 60;
-    
-    const text = `⏰ 冷却中...\n\n⏳ 剩余时间：**${mins}分${secs}秒**\n\n💡 升级VIP会员可免除等待`;
+    const text = `⏰ 冷却中...\n\n⏳ 剩余：**${mins}分${secs}秒**`;
     const keyboard = {
       inline_keyboard: [
         [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
         [{ text: '↩️ 返回首页', callback_data: 'back_start' }]
       ]
     };
-    if (messageId) {
-      return sendTelegram('editMessageText', { 
-        chat_id: chatId, 
-        message_id: messageId, 
-        text, 
-        parse_mode: 'Markdown',
-        reply_markup: keyboard 
-      });
-    }
-    return sendTelegram('sendMessage', { 
-      chat_id: chatId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
+    return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
 
   return showRedeemPage(chatId, messageId, 1);
 }
 
 async function showRedeemPage(chatId, messageId = null, page = 1) {
-  const products = store.products.sort((a, b) => a.createdAt - b.createdAt);
+  const result = await query('SELECT * FROM products ORDER BY created_at ASC');
+  const products = result.rows;
 
   if (products.length === 0) {
-    const text = `🎁 **兑换中心**\n\n⏳ 暂无商品，请等待管理员上架...`;
-    const keyboard = { inline_keyboard: [[{ text: '↩️ 返回首页', callback_data: 'back_start' }]] };
-    if (messageId) {
-      return sendTelegram('editMessageText', { 
-        chat_id: chatId, 
-        message_id: messageId, 
-        text, 
-        parse_mode: 'Markdown',
-        reply_markup: keyboard 
-      });
-    }
-    return sendTelegram('sendMessage', { 
-      chat_id: chatId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
+    const text = `🎁 **兑换中心**\n\n⏳ 暂无商品，请等待上架...`;
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
+        [{ text: '↩️ 返回首页', callback_data: 'back_start' }]
+      ]
+    };
+    if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
+    return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard });
   }
 
   const pageSize = 10;
@@ -729,69 +684,50 @@ async function showRedeemPage(chatId, messageId = null, page = 1) {
   const start = (page - 1) * pageSize;
   const pageProducts = products.slice(start, start + pageSize);
 
-  const buttons = pageProducts.map(p => [{ text: `📦 ${p.keyword}`, callback_data: `redeem_${p.keyword}` }]);
+  const buttons = pageProducts.map(p => [{ text: `📦 ${p.keyword}`, callback_data: `redeem_kw_${p.keyword}` }]);
 
-  // 分页按钮
+  // 始终显示加入会员按钮
+  buttons.push([{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }]);
+
   const navButtons = [];
-  if (page > 1) navButtons.push({ text: '⬅️ 上页', callback_data: `dh_page_${page - 1}` });
-  if (page < totalPages) navButtons.push({ text: '下页 ➡️', callback_data: `dh_page_${page + 1}` });
+  if (page > 1) navButtons.push({ text: '⬅️', callback_data: `dh_page_${page - 1}` });
+  if (page < totalPages) navButtons.push({ text: '➡️', callback_data: `dh_page_${page + 1}` });
   if (navButtons.length > 0) buttons.push(navButtons);
-  
+
   buttons.push([{ text: '↩️ 返回首页', callback_data: 'back_start' }]);
 
-  const text = `🎁 **兑换中心**\n\n📄 第 ${page}/${totalPages} 页\n\n请选择要兑换的内容：`;
+  const text = `🎁 **兑换中心**\n\n📄 ${page}/${totalPages} 页`;
 
-  if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons } 
-    });
-  }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: buttons } 
-  });
+  if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 }
 
 async function handleRedeemProduct(chatId, userId, username, firstName, keyword, messageId) {
-  // 更新用户使用数据
-  const user = store.users[userId];
-  if (user) {
-    const isNewUser = user.firstSeenDate === user.dateKey;
-    const freeLimit = isNewUser ? 3 : 2;
+  const user = await getOrCreateUser(userId, username, firstName);
+  const freeLimit = user.isNew ? 3 : 2;
 
-    user.dailyCount = (user.dailyCount || 0) + 1;
-    if (user.dailyCount > freeLimit) {
-      user.cooldownIndex = Math.min((user.cooldownIndex || 0) + 1, 5);
-    }
-    user.lastRedeemTime = Date.now();
-    store.users[userId] = user;
-  }
+  await query(
+    `UPDATE users SET daily_count = daily_count + 1, 
+     cooldown_index = CASE WHEN daily_count >= $1 THEN LEAST(cooldown_index + 1, 5) ELSE cooldown_index END,
+     last_redeem_time = $2 WHERE user_id = $3`,
+    [freeLimit, Date.now(), userId]
+  );
 
-  if (messageId) {
-    await sendTelegram('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
-  }
-
-  return sendProductContents(chatId, keyword, 1);
+  return sendProductContents(chatId, userId, keyword, 1, messageId);
 }
 
-async function sendProductContents(chatId, keyword, page) {
-  const product = store.products.find(p => p.keyword === keyword);
-  if (!product) {
+async function sendProductContents(chatId, userId, keyword, page, messageId = null) {
+  const productResult = await query('SELECT id FROM products WHERE keyword = $1', [keyword]);
+  if (productResult.rows.length === 0) {
     return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 商品不存在' });
   }
+  const productId = productResult.rows[0].id;
 
-  const contents = store.productContents
-    .filter(c => c.productId === product.id)
-    .sort((a, b) => a.sortOrder - b.sortOrder);
+  const contentsResult = await query('SELECT * FROM product_contents WHERE product_id = $1 ORDER BY sort_order ASC', [productId]);
+  const contents = contentsResult.rows;
 
   if (contents.length === 0) {
-    return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 该商品暂无内容' });
+    return sendTelegram('sendMessage', { chat_id: chatId, text: '❌ 暂无内容' });
   }
 
   const pageSize = 10;
@@ -799,64 +735,75 @@ async function sendProductContents(chatId, keyword, page) {
   const start = (page - 1) * pageSize;
   const pageContents = contents.slice(start, start + pageSize);
 
-  // 发送内容
+  // 删除之前的消息
+  if (messageId) {
+    await sendTelegram('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+  }
+
+  // 合并10条内容为一条消息
+  let combinedText = `📦 **${keyword}** - ${page}/${totalPages}\n\n`;
+  let mediaToSend = [];
+
   for (let i = 0; i < pageContents.length; i++) {
     const c = pageContents[i];
     const index = start + i + 1;
-    const caption = `📦 文件 ${index}/${contents.length}`;
 
-    try {
-      if (c.contentType === 'photo' && c.fileId) {
-        await sendTelegram('sendPhoto', { chat_id: chatId, photo: c.fileId, caption });
-      } else if (c.contentType === 'document' && c.fileId) {
-        await sendTelegram('sendDocument', { chat_id: chatId, document: c.fileId, caption });
-      } else if (c.contentType === 'video' && c.fileId) {
-        await sendTelegram('sendVideo', { chat_id: chatId, video: c.fileId, caption });
-      } else if (c.contentType === 'audio' && c.fileId) {
-        await sendTelegram('sendAudio', { chat_id: chatId, audio: c.fileId, caption });
-      } else if (c.contentType === 'animation' && c.fileId) {
-        await sendTelegram('sendAnimation', { chat_id: chatId, animation: c.fileId, caption });
-      } else if (c.content) {
-        await sendTelegram('sendMessage', { chat_id: chatId, text: `${caption}\n\n${c.content}` });
-      }
-    } catch (e) {
-      console.error('Send content error:', e.message);
+    if (c.file_id) {
+      mediaToSend.push({ type: c.content_type, fileId: c.file_id, caption: c.content, index });
+    } else if (c.content) {
+      combinedText += `📄 **[${index}]**\n${c.content}\n\n`;
     }
   }
 
-  // 发送操作按钮
-  if (page < totalPages) {
-    return sendTelegram('sendMessage', {
-      chat_id: chatId,
-      text: `✨ 已发送 ${page * pageSize}/${contents.length} 条\n\n👉 点击继续接收`,
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📥 继续发送', callback_data: `redeem_continue_${keyword}_${page + 1}` }],
-          [{ text: '↩️ 返回兑换中心', callback_data: 'back_redeem' }]
-        ]
-      }
-    });
-  } else {
-    return sendTelegram('sendMessage', {
-      chat_id: chatId,
-      text: `✅ 全部 ${contents.length} 条内容发送完毕！`,
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
-          [{ text: '↩️ 返回兑换中心', callback_data: 'back_redeem' }]
-        ]
-      }
-    });
+  // 发送文本内容
+  if (combinedText.length > 50) {
+    await sendTelegram('sendMessage', { chat_id: chatId, text: combinedText, parse_mode: 'Markdown' });
   }
+
+  // 发送媒体文件（每个单独发送并标记序号）
+  for (const media of mediaToSend) {
+    const caption = `📦 [${media.index}/${contents.length}] ${media.caption || ''}`;
+    if (media.type === 'photo') {
+      await sendTelegram('sendPhoto', { chat_id: chatId, photo: media.fileId, caption });
+    } else if (media.type === 'document') {
+      await sendTelegram('sendDocument', { chat_id: chatId, document: media.fileId, caption });
+    } else if (media.type === 'video') {
+      await sendTelegram('sendVideo', { chat_id: chatId, video: media.fileId, caption });
+    } else if (media.type === 'audio') {
+      await sendTelegram('sendAudio', { chat_id: chatId, audio: media.fileId, caption });
+    } else if (media.type === 'animation') {
+      await sendTelegram('sendAnimation', { chat_id: chatId, animation: media.fileId, caption });
+    }
+  }
+
+  // 操作按钮
+  const buttons = [];
+
+  if (page < totalPages) {
+    buttons.push([{ text: `📥 继续发送 (${page + 1}/${totalPages})`, callback_data: `redeem_page_${keyword}_${page + 1}` }]);
+  }
+
+  buttons.push([{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }]);
+  buttons.push([{ text: '↩️ 返回兑换中心', callback_data: 'back_redeem' }]);
+
+  const statusText = page < totalPages
+    ? `✨ 已发送 ${page}/${totalPages} 组`
+    : `✅ 全部 ${contents.length} 条发送完毕！`;
+
+  return sendTelegram('sendMessage', {
+    chat_id: chatId,
+    text: statusText,
+    reply_markup: { inline_keyboard: buttons }
+  });
 }
 
 // ============== 管理员页面 ==============
 async function showAdminPanel(chatId, messageId = null) {
-  const text = `🔧 **管理员面板**\n\n` +
-    `📊 统计：\n` +
-    `• 用户数：${Object.keys(store.users).length}\n` +
-    `• 商品数：${store.products.length}\n` +
-    `• 工单数：${store.tickets.length}`;
+  const usersResult = await query('SELECT COUNT(*) as cnt FROM users');
+  const productsResult = await query('SELECT COUNT(*) as cnt FROM products');
+  const ticketsResult = await query('SELECT COUNT(*) as cnt FROM tickets');
+
+  const text = `🔧 **管理员面板**\n\n📊 统计：\n• 用户：${usersResult.rows[0].cnt}\n• 商品：${productsResult.rows[0].cnt}\n• 工单：${ticketsResult.rows[0].cnt}`;
 
   const keyboard = {
     inline_keyboard: [
@@ -867,25 +814,13 @@ async function showAdminPanel(chatId, messageId = null) {
     ]
   };
 
-  if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
-  }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: keyboard 
-  });
+  if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard });
 }
 
 async function showProductManagement(chatId, messageId = null, page = 1) {
-  const products = store.products.sort((a, b) => a.createdAt - b.createdAt);
+  const result = await query('SELECT * FROM products ORDER BY created_at ASC');
+  const products = result.rows;
 
   const pageSize = 10;
   const totalPages = Math.max(1, Math.ceil(products.length / pageSize));
@@ -895,9 +830,9 @@ async function showProductManagement(chatId, messageId = null, page = 1) {
   const buttons = [[{ text: '➕ 上架新关键词', callback_data: 'add_product' }]];
 
   for (const p of pageProducts) {
-    const contentCount = store.productContents.filter(c => c.productId === p.id).length;
+    const countResult = await query('SELECT COUNT(*) as cnt FROM product_contents WHERE product_id = $1', [p.id]);
     buttons.push([
-      { text: `📦 ${p.keyword} (${contentCount}条)`, callback_data: `view_product_${p.id}` },
+      { text: `📦 ${p.keyword} (${countResult.rows[0].cnt}条)`, callback_data: `view_product_${p.id}` },
       { text: '🗑️', callback_data: `del_product_confirm_${p.id}` }
     ]);
   }
@@ -907,48 +842,32 @@ async function showProductManagement(chatId, messageId = null, page = 1) {
   if (page < totalPages) navButtons.push({ text: '➡️', callback_data: `products_page_${page + 1}` });
   if (navButtons.length > 0) buttons.push(navButtons);
 
-  buttons.push([{ text: '↩️ 返回管理面板', callback_data: 'admin' }]);
+  buttons.push([{ text: '↩️ 返回', callback_data: 'admin' }]);
 
-  const text = `📦 **商品管理**\n\n📄 ${page}/${totalPages} 页 · 共 ${products.length} 个商品`;
+  const text = `📦 **商品管理**\n\n📄 ${page}/${totalPages} 页`;
 
-  if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons } 
-    });
-  }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: buttons } 
-  });
+  if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 }
 
 async function showTickets(chatId, messageId = null, page = 1) {
-  const tickets = store.tickets.sort((a, b) => a.createdAt - b.createdAt);
+  const result = await query('SELECT * FROM tickets ORDER BY created_at ASC');
+  const tickets = result.rows;
 
   const pageSize = 10;
   const totalPages = Math.max(1, Math.ceil(tickets.length / pageSize));
   const start = (page - 1) * pageSize;
   const pageTickets = tickets.slice(start, start + pageSize);
 
-  let text = `🎫 **工单管理**\n\n📄 ${page}/${totalPages} 页\n\n`;
+  let text = `🎫 **工单管理**\n\n📄 ${page}/${totalPages} 页\n`;
 
   const buttons = [];
-  
+
   if (pageTickets.length === 0) {
-    text += '暂无工单';
+    text += '\n暂无工单';
   } else {
     for (const t of pageTickets) {
-      const time = formatBeijingTime(new Date(t.createdAt));
-      buttons.push([
-        { text: `@${t.username || '无'} (${t.userId})`, callback_data: `ticket_detail_${t.id}` },
-        { text: '🗑️', callback_data: `del_ticket_${t.id}` }
-      ]);
+      buttons.push([{ text: `👤 ${t.first_name || '未知'} (${t.user_id})`, callback_data: `ticket_detail_${t.id}` }]);
     }
   }
 
@@ -957,64 +876,46 @@ async function showTickets(chatId, messageId = null, page = 1) {
   if (page < totalPages) navButtons.push({ text: '➡️', callback_data: `tickets_page_${page + 1}` });
   if (navButtons.length > 0) buttons.push(navButtons);
 
-  buttons.push([{ text: '↩️ 返回管理面板', callback_data: 'admin' }]);
+  buttons.push([{ text: '↩️ 返回', callback_data: 'admin' }]);
 
-  if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons } 
-    });
-  }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: buttons } 
-  });
+  if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 }
 
 async function showTicketDetail(chatId, messageId, ticketId) {
-  const ticket = store.tickets.find(t => t.id === ticketId);
+  const result = await query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
 
-  if (!ticket) {
+  if (result.rows.length === 0) {
     return sendTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
+      chat_id: chatId, message_id: messageId,
       text: '❌ 工单不存在',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'ticket_manage' }]] }
     });
   }
 
+  const t = result.rows[0];
   const text = `🎫 **工单详情**\n\n` +
-    `👤 姓名：${ticket.firstName || '未知'}\n` +
-    `👤 用户名：@${ticket.username || '无'}\n` +
-    `🆔 用户ID：\`${ticket.userId}\`\n` +
-    `📝 订单号：\`${ticket.orderNumber}\`\n` +
-    `⏰ 时间：${formatBeijingTime(new Date(ticket.createdAt))}`;
+    `━━━━━━━━━━━━━━\n` +
+    `👤 **姓名**：${t.first_name || '未知'}\n` +
+    `👤 **用户名**：@${t.username || '无'}\n` +
+    `🆔 **用户ID**：\`${t.user_id}\`\n` +
+    `📝 **订单号**：\`${t.order_number}\`\n` +
+    `⏰ **提交时间**：${formatBeijingTime(t.created_at)}\n` +
+    `━━━━━━━━━━━━━━`;
 
   const keyboard = {
     inline_keyboard: [
-      [{ text: '🗑️ 删除工单', callback_data: `del_ticket_${ticketId}` }],
+      [{ text: '🗑️ 删除此工单', callback_data: `del_ticket_confirm_${ticketId}` }],
       [{ text: '↩️ 返回工单列表', callback_data: 'ticket_manage' }]
     ]
   };
 
-  return sendTelegram('editMessageText', { 
-    chat_id: chatId, 
-    message_id: messageId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: keyboard 
-  });
+  return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
 }
 
 async function showUsers(chatId, messageId = null, page = 1) {
-  const users = Object.values(store.users).sort((a, b) =>
-    (a.firstSeenDate || '').localeCompare(b.firstSeenDate || '')
-  );
+  const result = await query('SELECT * FROM users ORDER BY first_seen_date ASC');
+  const users = result.rows;
 
   const pageSize = 10;
   const totalPages = Math.max(1, Math.ceil(users.length / pageSize));
@@ -1029,11 +930,8 @@ async function showUsers(chatId, messageId = null, page = 1) {
     text += '\n暂无用户';
   } else {
     for (const u of pageUsers) {
-      const status = u.isDisabled ? '🔴' : '🟢';
-      buttons.push([{ 
-        text: `${status} @${u.username || '无'} (${u.userId})`, 
-        callback_data: `user_detail_${u.userId}` 
-      }]);
+      const status = u.is_disabled ? '🔴' : '🟢';
+      buttons.push([{ text: `${status} ${u.first_name || '未知'} (${u.user_id})`, callback_data: `user_detail_${u.user_id}` }]);
     }
   }
 
@@ -1042,51 +940,41 @@ async function showUsers(chatId, messageId = null, page = 1) {
   if (page < totalPages) navButtons.push({ text: '➡️', callback_data: `users_page_${page + 1}` });
   if (navButtons.length > 0) buttons.push(navButtons);
 
-  buttons.push([{ text: '↩️ 返回管理面板', callback_data: 'admin' }]);
+  buttons.push([{ text: '↩️ 返回', callback_data: 'admin' }]);
 
-  if (messageId) {
-    return sendTelegram('editMessageText', { 
-      chat_id: chatId, 
-      message_id: messageId, 
-      text, 
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons } 
-    });
-  }
-  return sendTelegram('sendMessage', { 
-    chat_id: chatId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: buttons } 
-  });
+  if (messageId) return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  return sendTelegram('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
 }
 
 async function showUserDetail(chatId, messageId, targetUserId) {
-  const u = store.users[targetUserId];
+  const result = await query('SELECT * FROM users WHERE user_id = $1', [targetUserId]);
 
-  if (!u) {
+  if (result.rows.length === 0) {
     return sendTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
+      chat_id: chatId, message_id: messageId,
       text: '❌ 用户不存在',
       reply_markup: { inline_keyboard: [[{ text: '↩️ 返回', callback_data: 'user_manage' }]] }
     });
   }
 
-  const status = u.isDisabled ? '🔴 已停用' : '🟢 正常';
-  const isNewUser = u.firstSeenDate === u.dateKey;
+  const u = result.rows[0];
+  const status = u.is_disabled ? '🔴 已停用' : '🟢 正常';
+  const isNew = u.first_seen_date === u.date_key;
 
   const text = `👤 **用户详情**\n\n` +
-    `👤 姓名：${u.firstName || '未知'}\n` +
-    `👤 用户名：@${u.username || '无'}\n` +
-    `🆔 ID：\`${u.userId}\`\n` +
-    `📅 首次：${u.firstSeenDate || '未知'}\n` +
-    `📅 最近：${u.lastSeenDate || '未知'}\n` +
-    `📊 今日兑换：${u.dailyCount || 0} 次\n` +
-    `🆕 新用户：${isNewUser ? '是' : '否'}\n` +
-    `⚡ 状态：${status}`;
+    `━━━━━━━━━━━━━━\n` +
+    `👤 **姓名**：${u.first_name || '未知'}\n` +
+    `👤 **用户名**：@${u.username || '无'}\n` +
+    `🆔 **用户ID**：\`${u.user_id}\`\n` +
+    `📅 **首次访问**：${u.first_seen_date || '未知'}\n` +
+    `📅 **最近访问**：${u.last_seen_date || '未知'}\n` +
+    `📊 **今日兑换**：${u.daily_count || 0} 次\n` +
+    `⏱️ **冷却等级**：${u.cooldown_index || 0}\n` +
+    `🆕 **新用户**：${isNew ? '是' : '否'}\n` +
+    `⚡ **状态**：${status}\n` +
+    `━━━━━━━━━━━━━━`;
 
-  const toggleText = u.isDisabled ? '✅ 启用用户' : '🔴 停用用户';
+  const toggleText = u.is_disabled ? '✅ 启用用户' : '🔴 停用用户';
 
   const keyboard = {
     inline_keyboard: [
@@ -1095,11 +983,5 @@ async function showUserDetail(chatId, messageId, targetUserId) {
     ]
   };
 
-  return sendTelegram('editMessageText', { 
-    chat_id: chatId, 
-    message_id: messageId, 
-    text, 
-    parse_mode: 'Markdown',
-    reply_markup: keyboard 
-  });
+  return sendTelegram('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: keyboard });
 }
