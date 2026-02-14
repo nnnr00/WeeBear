@@ -1,18 +1,19 @@
 {
   "name": "spring-festival-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "build": "echo 'No build needed'"
+    "build": "echo 'No build needed'",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "telegraf": "^4.12.0",
     "mysql2": "^3.6.0",
     "pg": "^8.11.0",
     "dotenv": "^16.3.1",
-    "date-fns": "^2.30.0",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "date-fns": "^2.30.0"
   },
   "engines": {
     "node": "18.x"
