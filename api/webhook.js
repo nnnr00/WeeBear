@@ -1,4 +1,3 @@
-const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -9,12 +8,32 @@ const COOLDOWN_SEQUENCE = [5, 10, 30, 40, 50];
 const MAX_DAILY_USES = 10;
 const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
 
-// 数据库操作类
+// 数据库类
 class Database {
   async getUser(userId) {
-    const user = await kv.get(`user:${userId}`);
-    if (user) return user;
-    
+    try {
+      const user = await kv.get(`user:${userId}`);
+      if (user) return user;
+      
+      const today = this.getBeijingDateKey();
+      return {
+        id: userId,
+        first_seen_date: today,
+        dh_count: 0,
+        dh_free_count: 0,
+        cooldown_until: null,
+        cooldown_level: 0,
+        last_date_key: today,
+        is_vip: false,
+        failed_attempts: 0
+      };
+    } catch (error) {
+      console.error('Error getting user:', error);
+      return this.createNewUser(userId);
+    }
+  }
+
+  createNewUser(userId) {
     const today = this.getBeijingDateKey();
     return {
       id: userId,
@@ -30,15 +49,28 @@ class Database {
   }
 
   async saveUser(userId, userData) {
-    await kv.set(`user:${userId}`, userData);
+    try {
+      await kv.set(`user:${userId}`, userData);
+    } catch (error) {
+      console.error('Error saving user:', error);
+    }
   }
 
   async getProducts() {
-    return await kv.get('products') || {};
+    try {
+      return await kv.get('products') || {};
+    } catch (error) {
+      console.error('Error getting products:', error);
+      return {};
+    }
   }
 
   async saveProducts(products) {
-    await kv.set('products', products);
+    try {
+      await kv.set('products', products);
+    } catch (error) {
+      console.error('Error saving products:', error);
+    }
   }
 
   async addProduct(keyword, items) {
@@ -54,11 +86,20 @@ class Database {
   }
 
   async getTickets() {
-    return await kv.get('tickets') || [];
+    try {
+      return await kv.get('tickets') || [];
+    } catch (error) {
+      console.error('Error getting tickets:', error);
+      return [];
+    }
   }
 
   async saveTickets(tickets) {
-    await kv.set('tickets', tickets);
+    try {
+      await kv.set('tickets', tickets);
+    } catch (error) {
+      console.error('Error saving tickets:', error);
+    }
   }
 
   async addTicket(userId, username, orderNumber) {
@@ -91,26 +132,42 @@ class Database {
   }
 
   async getUserState(userId) {
-    return await kv.get(`state:${userId}`);
+    try {
+      return await kv.get(`state:${userId}`);
+    } catch (error) {
+      return null;
+    }
   }
 
   async setUserState(userId, state) {
-    if (state) {
-      await kv.set(`state:${userId}`, state, { ex: 3600 });
-    } else {
-      await kv.del(`state:${userId}`);
+    try {
+      if (state) {
+        await kv.set(`state:${userId}`, state, { ex: 3600 });
+      } else {
+        await kv.del(`state:${userId}`);
+      }
+    } catch (error) {
+      console.error('Error setting user state:', error);
     }
   }
 
   async getPBuffer(userId) {
-    return await kv.get(`p_buffer:${userId}`) || null;
+    try {
+      return await kv.get(`p_buffer:${userId}`) || null;
+    } catch (error) {
+      return null;
+    }
   }
 
   async setPBuffer(userId, data) {
-    if (data) {
-      await kv.set(`p_buffer:${userId}`, data, { ex: 3600 });
-    } else {
-      await kv.del(`p_buffer:${userId}`);
+    try {
+      if (data) {
+        await kv.set(`p_buffer:${userId}`, data, { ex: 3600 });
+      } else {
+        await kv.del(`p_buffer:${userId}`);
+      }
+    } catch (error) {
+      console.error('Error setting p_buffer:', error);
     }
   }
 
@@ -180,153 +237,87 @@ class BotHandler {
     this.adminId = adminId;
   }
 
+  async apiRequest(method, params = {}) {
+    const url = `https://api.telegram.org/bot${this.token}/${method}`;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+      return await response.json();
+    } catch (error) {
+      console.error(`API request failed for ${method}:`, error);
+      return { ok: false, error: error.message };
+    }
+  }
+
   async sendMessage(chatId, text, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/sendMessage`;
-    const body = {
+    return this.apiRequest('sendMessage', {
       chat_id: chatId,
       text: text,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendPhoto(chatId, photo, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/sendPhoto`;
-    const body = {
+    return this.apiRequest('sendPhoto', {
       chat_id: chatId,
       photo: photo,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendDocument(chatId, document, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/sendDocument`;
-    const body = {
+    return this.apiRequest('sendDocument', {
       chat_id: chatId,
       document: document,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendVideo(chatId, video, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/sendVideo`;
-    const body = {
+    return this.apiRequest('sendVideo', {
       chat_id: chatId,
       video: video,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendAudio(chatId, audio, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/sendAudio`;
-    const body = {
+    return this.apiRequest('sendAudio', {
       chat_id: chatId,
       audio: audio,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendVoice(chatId, voice) {
-    const url = `https://api.telegram.org/bot${this.token}/sendVoice`;
-    const body = {
+    return this.apiRequest('sendVoice', {
       chat_id: chatId,
       voice: voice
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async sendSticker(chatId, sticker) {
-    const url = `https://api.telegram.org/bot${this.token}/sendSticker`;
-    const body = {
+    return this.apiRequest('sendSticker', {
       chat_id: chatId,
       sticker: sticker
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async editMessageText(text, options) {
-    const url = `https://api.telegram.org/bot${this.token}/editMessageText`;
-    const body = {
+    return this.apiRequest('editMessageText', {
       text: text,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async answerCallbackQuery(callbackQueryId, options = {}) {
-    const url = `https://api.telegram.org/bot${this.token}/answerCallbackQuery`;
-    const body = {
+    return this.apiRequest('answerCallbackQuery', {
       callback_query_id: callbackQueryId,
       ...options
-    };
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
     });
-    
-    return await response.json();
   }
 
   async handleMessage(msg) {
@@ -335,14 +326,12 @@ class BotHandler {
     const text = msg.text;
 
     try {
-      // 取消命令（仅管理员）
       if (text === '/c' && isAdmin(userId, this.adminId)) {
         await db.setUserState(userId, null);
         await this.sendMessage(chatId, '✅ 已取消当前操作');
         return;
       }
 
-      // 重置命令（仅管理员）
       if (text === '/cz' && isAdmin(userId, this.adminId)) {
         const user = await db.getUser(userId);
         const today = db.getBeijingDateKey();
@@ -357,7 +346,6 @@ class BotHandler {
         return;
       }
 
-      // 检查用户状态
       const state = await db.getUserState(userId);
 
       if (state) {
@@ -365,7 +353,6 @@ class BotHandler {
         return;
       }
 
-      // 命令处理
       if (text?.startsWith('/')) {
         const command = text.split(' ')[0].split('@')[0];
         
@@ -402,7 +389,6 @@ class BotHandler {
     try {
       await this.answerCallbackQuery(query.id);
 
-      // Admin 面板回调
       if (data === 'admin_fileid') {
         await db.setUserState(userId, { action: 'waiting_file_id' });
         await this.sendMessage(chatId, '📎 请发送图片以获取 File ID');
@@ -429,7 +415,6 @@ class BotHandler {
         return;
       }
 
-      // VIP 购买流程
       if (data === 'buy_vip') {
         await this.handleVIP({ chat: { id: chatId }, from: { id: userId } });
         return;
@@ -449,7 +434,6 @@ class BotHandler {
         return;
       }
 
-      // 兑换
       if (data === 'exchange') {
         await this.handleExchange({ chat: { id: chatId }, from: { id: userId } });
         return;
@@ -479,7 +463,6 @@ class BotHandler {
         return;
       }
 
-      // 商品管理
       if (data === 'add_product') {
         await db.setUserState(userId, { action: 'waiting_keyword' });
         await this.sendMessage(chatId, '📝 请输入关键词：');
@@ -520,7 +503,6 @@ class BotHandler {
         return;
       }
 
-      // 工单管理
       if (data.startsWith('ticket_')) {
         const ticketUserId = data.replace('ticket_', '');
         await this.showTicketDetail(chatId, messageId, ticketUserId);
@@ -538,7 +520,6 @@ class BotHandler {
         return;
       }
 
-      // 分页
       if (data.startsWith('page_')) {
         const parts = data.split('_');
         const type = parts[1];
@@ -566,7 +547,6 @@ class BotHandler {
     const userId = msg.from.id;
     const username = msg.from.username || msg.from.first_name;
 
-    // 获取 File ID
     if (state.action === 'waiting_file_id') {
       if (msg.photo) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
@@ -581,20 +561,16 @@ class BotHandler {
       return;
     }
 
-    // 等待订单号
     if (state.action === 'waiting_order_number') {
       const orderNumber = extractOrderNumber(msg.text || '');
       
       if (orderNumber) {
-        // 验证成功
         const user = await db.getUser(userId);
         user.is_vip = true;
         await db.saveUser(userId, user);
         
-        // 添加工单
         await db.addTicket(userId, username, orderNumber);
         
-        // 通知管理员
         await this.sendMessage(this.adminId,
           `🎫 新工单\n` +
           `👤 用户：@${username}\n` +
@@ -603,7 +579,6 @@ class BotHandler {
           `🕐 时间：${db.getBeijingTime()}`
         );
         
-        // 发送加入群组按钮
         const keyboard = createInlineKeyboard([[
           { text: '💎 加入会员群', callback_data: 'join_vip_group' }
         ]]);
@@ -611,7 +586,6 @@ class BotHandler {
         await this.sendMessage(chatId, '✅ 验证成功！欢迎成为VIP会员！', keyboard);
         await db.setUserState(userId, null);
       } else {
-        // 验证失败
         state.attempts = (state.attempts || 0) + 1;
         
         if (state.attempts >= 2) {
@@ -626,7 +600,6 @@ class BotHandler {
       return;
     }
 
-    // 等待商品关键词
     if (state.action === 'waiting_keyword') {
       const keyword = msg.text?.trim();
       if (keyword) {
@@ -646,11 +619,9 @@ class BotHandler {
       return;
     }
 
-    // 等待商品内容
     if (state.action === 'waiting_product_content') {
       const buffer = await db.getPBuffer(userId);
       if (buffer) {
-        // 存储消息内容
         const item = {
           type: this.getMessageType(msg),
           content: this.extractMessageContent(msg)
@@ -697,7 +668,6 @@ class BotHandler {
   async handleStart(msg) {
     const chatId = msg.chat.id;
 
-    // 检查 deep link
     const startParam = msg.text?.split(' ')[1];
     if (startParam === 'dh') {
       await this.handleExchange(msg);
@@ -775,7 +745,6 @@ class BotHandler {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
 
-    // 检查频控
     const cooldownCheck = await this.checkCooldown(userId);
     if (!cooldownCheck.allowed) {
       const keyboard = createInlineKeyboard([
@@ -808,7 +777,6 @@ class BotHandler {
       return;
     }
 
-    // 分页
     const perPage = 10;
     const totalPages = Math.ceil(keywords.length / perPage);
     const startIdx = (page - 1) * perPage;
@@ -820,7 +788,6 @@ class BotHandler {
       callback_data: `product_${kw}`
     }]);
 
-    // 添加分页按钮
     if (totalPages > 1) {
       const navButtons = [];
       if (page > 1) {
@@ -859,10 +826,8 @@ class BotHandler {
       return;
     }
 
-    // 增加使用次数
     await this.incrementUsage(userId);
 
-    // 分组发送
     const chunks = chunkArray(items, 10);
     const currentChunk = chunks[groupIndex];
 
@@ -904,7 +869,6 @@ class BotHandler {
             break;
         }
 
-        // 添加延迟避免触发限流
         if (i < currentChunk.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
@@ -913,7 +877,6 @@ class BotHandler {
       }
     }
 
-    // 发送完成或继续按钮
     if (groupIndex < chunks.length - 1) {
       const keyboard = createInlineKeyboard([[
         { text: '✨ 点击继续发送 👉', callback_data: `continue_send_${keyword}_${groupIndex + 1}` }
@@ -932,7 +895,6 @@ class BotHandler {
     const user = await db.getUser(userId);
     const today = db.getBeijingDateKey();
 
-    // 检查日期是否变化，重置计数
     if (user.last_date_key !== today) {
       user.last_date_key = today;
       user.dh_count = 0;
@@ -942,12 +904,10 @@ class BotHandler {
       await db.saveUser(userId, user);
     }
 
-    // VIP 用户无限制
     if (user.is_vip) {
       return { allowed: true };
     }
 
-    // 检查每日上限
     if (user.dh_count >= MAX_DAILY_USES) {
       return {
         allowed: false,
@@ -955,7 +915,6 @@ class BotHandler {
       };
     }
 
-    // 检查冷却时间
     if (user.cooldown_until) {
       const now = Date.now();
       if (now < user.cooldown_until) {
@@ -967,7 +926,6 @@ class BotHandler {
       }
     }
 
-    // 判断是否为新用户
     const isNewUser = user.first_seen_date === today;
     const freeLimit = isNewUser ? 3 : 2;
 
@@ -975,7 +933,6 @@ class BotHandler {
       return { allowed: true, isFree: true };
     }
 
-    // 需要冷却
     return { allowed: true, needCooldown: true };
   }
 
@@ -983,7 +940,6 @@ class BotHandler {
     const user = await db.getUser(userId);
     const today = db.getBeijingDateKey();
 
-    // 确保日期正确
     if (user.last_date_key !== today) {
       user.last_date_key = today;
       user.dh_count = 0;
@@ -999,7 +955,6 @@ class BotHandler {
     if (user.dh_free_count < freeLimit) {
       user.dh_free_count += 1;
     } else {
-      // 设置冷却
       const cooldownSeconds = COOLDOWN_SEQUENCE[Math.min(user.cooldown_level, COOLDOWN_SEQUENCE.length - 1)];
       user.cooldown_until = Date.now() + cooldownSeconds * 1000;
       user.cooldown_level += 1;
@@ -1028,7 +983,6 @@ class BotHandler {
 
     const buttons = [];
     
-    // 商品列表
     pageKeywords.forEach(kw => {
       buttons.push([{
         text: `📦 ${kw} (${products[kw].length}条)`,
@@ -1036,7 +990,6 @@ class BotHandler {
       }]);
     });
 
-    // 分页按钮
     if (totalPages > 1) {
       const navButtons = [];
       if (page > 1) {
@@ -1050,7 +1003,6 @@ class BotHandler {
       }
     }
 
-    // 操作按钮
     buttons.push([
       { text: '➕ 上架新商品', callback_data: 'add_product' },
       { text: '🗑 删除商品', callback_data: 'delete_product' }
@@ -1092,7 +1044,6 @@ class BotHandler {
       callback_data: `del_product_${kw}`
     }]);
 
-    // 分页按钮
     if (totalPages > 1) {
       const navButtons = [];
       if (page > 1) {
@@ -1170,7 +1121,6 @@ class BotHandler {
       callback_data: `ticket_${ticket.userId}`
     }]);
 
-    // 分页按钮
     if (totalPages > 1) {
       const navButtons = [];
       if (page > 1) {
@@ -1239,6 +1189,10 @@ class BotHandler {
 }
 
 module.exports = async (req, res) => {
+  // 设置 CORS 头
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
+  
   if (req.method === 'POST') {
     try {
       const update = req.body;
@@ -1247,10 +1201,9 @@ module.exports = async (req, res) => {
       res.status(200).json({ ok: true });
     } catch (error) {
       console.error('Error processing update:', error);
-      res.status(200).json({ ok: true }); // 总是返回 200 给 Telegram
+      res.status(200).json({ ok: true });
     }
   } else if (req.method === 'GET') {
-    // 设置 webhook
     const webhookUrl = `${WEBHOOK_URL}/api/webhook`;
     try {
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${webhookUrl}`);
