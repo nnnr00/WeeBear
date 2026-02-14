@@ -1,9 +1,17 @@
 {
-  "name": "telegram-bot",
+  "name": "telegram-bot-vercel",
   "version": "1.0.0",
-  "main": "api/index.js",
+  "description": "Telegram Bot deployed on Vercel",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
   "dependencies": {
-    "grammy": "^1.21.1",
-    "pg": "^8.11.3"
+    "grammy": "^1.19.2",
+    "@vercel/kv": "^1.0.0"
+  },
+  "devDependencies": {
+    "vercel": "^32.5.0"
   }
 }
