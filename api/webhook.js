@@ -1506,7 +1506,7 @@ async function showUsers(chatId, messageId, page) {
   });
 }
 
-// 用户详情
+// 用户详情（续）
 async function showUserDetail(chatId, messageId, targetUserId) {
   let user = null;
   try {
@@ -1532,4 +1532,30 @@ async function showUserDetail(chatId, messageId, targetUserId) {
   const status = user.is_disabled ? '🔴 已停用' : '🟢 正常';
   const dateKey = getBeijingDateKey();
   const isNewUser = user.first_seen_date === dateKey;
-  const text = `👤 <b>用户详情</b>\n\n
+  const text = `👤 <b>用户详情</b>\n\n` +
+    `━━━━━━━━━━━━━━\n` +
+    `👤 <b>姓名</b>：${user.first_name || '未知'}\n` +
+    `👤 <b>用户名</b>：@${user.username || '无'}\n` +
+    `🆔 <b>用户ID</b>：<code>${user.user_id}</code>\n` +
+    `📅 <b>首次访问</b>：${user.first_seen_date || '未知'}\n` +
+    `📅 <b>最近访问</b>：${user.last_seen_date || '未知'}\n` +
+    `📊 <b>今日兑换</b>：${user.daily_count || 0} 次\n` +
+    `⏱️ <b>冷却等级</b>：${user.cooldown_index || 0}\n` +
+    `🆕 <b>新用户</b>：${isNewUser ? '是' : '否'}\n` +
+    `⚡ <b>状态</b>：${status}\n` +
+    `━━━━━━━━━━━━━━`;
+  const toggleText = user.is_disabled ? '✅ 启用用户' : '🔴 停用用户';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: toggleText, callback_data: 'toggle_user_' + targetUserId }],
+      [{ text: '↩️ 返回用户列表', callback_data: 'user_manage' }]
+    ]
+  };
+  return await sendTelegram('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text,
+    parse_mode: 'HTML',
+    reply_markup: keyboard
+  });
+}
