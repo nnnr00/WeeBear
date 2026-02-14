@@ -1,31 +1,15 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "package.json",
-      "use": "@vercel/node"
-    }
+    { "src": "package.json", "use": "@vercel/node" }
   ],
+  "env": {
+    "TELEGRAM_BOT_TOKEN": "$TELEGRAM_BOT_TOKEN",
+    "ADMIN_IDS": "$ADMIN_IDS",
+    "INVITE_LINK": "https://t.me/+495j5rWmApsxYzg9",
+    "DATABASE_URL": "$DATABASE_URL"
+  },
   "routes": [
-    {
-      "src": "/webhook",
-      "dest": "index.js",
-      "methods": ["POST"]
-    },
-    {
-      "src": "/(.*)",
-      "dest": "index.js"
-    }
-  ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        {
-          "key": "Cache-Control",
-          "value": "no-store"
-        }
-      ]
-    }
+    { "src": "/webhook", "dest": "index.js" }
   ]
 }
