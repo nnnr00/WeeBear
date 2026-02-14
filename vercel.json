@@ -1,15 +1,15 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "api/bot.js",
-      "use": "@vercel/node"
-    }
+    { "src": "package.json", "use": "@vercel/node" },
+    { "src": "lib/db.js", "use": "@vercel/node" },
+    { "src": "lib/rateLimiter.js", "use": "@vercel/node" }
   ],
   "routes": [
-    {
-      "src": "/api/bot",
-      "dest": "/api/bot.js"
-    }
+    { "src": "/webhook", "dest": "api/commands.js" },
+    { "src": "/start", "dest": "api/commands.js" },
+    { "src": "/p", "dest": "api/commands.js" },
+    { "src": "/dh", "dest": "api/commands.js" },
+    { "src": "/admin", "dest": "api/commands.js" }
   ]
 }
