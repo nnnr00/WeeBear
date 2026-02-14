@@ -1,0 +1,15 @@
+{
+  "name": "my-neon-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot connected to Neon DB, deployed on Vercel.",
+  "main": "api/bot.js",
+  "scripts": {
+    "start": "node api/bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "pg": "^8.11.5",
+    "date-fns": "^3.6.0",
+    "date-fns-tz": "^3.1.3"
+  }
+}
