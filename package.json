@@ -1,6 +1,7 @@
 {
   "name": "telegram-vip-bot",
   "version": "1.0.0",
+  "type": "module",
   "description": "Telegram VIP Bot with Admin Panel",
   "main": "api/webhook.js",
   "scripts": {
