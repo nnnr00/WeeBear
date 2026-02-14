@@ -1,13 +1,11 @@
 {
   "name": "telegram-bot",
   "version": "1.0.0",
-  "description": "Telegram Bot for Vercel",
   "main": "api/webhook.js",
   "scripts": {
     "setup": "node scripts/setup-webhook.js"
   },
   "dependencies": {
-    "node-fetch": "^2.6.7",
-    "@vercel/postgres": "^0.5.1"
+    "pg": "^8.11.3"
   }
 }
