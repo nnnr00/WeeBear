@@ -1,13 +1,16 @@
-// index.js
+// index.js - Vercel 入口文件
 require('dotenv').config();
 const express = require('express');
 const { initDB } = require('./lib/db');
 const { bot } = require('./api/commands');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// 解析Telegram webhook请求
-app.use(express.json({ limit: '50mb' }));
+// 添加关键启动日志
+console.log(`[SERVER] Starting on port ${PORT}`);
+console.log(`[WEBHOOK] Ready at /webhook`);
+console.log(`[DEBUG] Environment: NODE_ENV=${process.env.NODE_ENV}`);
 
 // 初始化数据库
 initDB()
@@ -17,44 +20,63 @@ initDB()
     process.exit(1);
   });
 
-// Webhook端点
+// 必须处理 JSON 请求体
+app.use(express.json({ limit: '50mb' }));
+
+// Webhook 端点
 app.post('/webhook', (req, res) => {
+  console.log('[WEBHOOK] Received update request');
+  
   bot.handleUpdate(req.body)
-    .then(() => res.end('ok'))
-    .catch(err => {
-      console.error('[WEBHOOK] 处理失败:', err);
+    .then(() => {
+      console.log('[WEBHOOK] Update handled successfully');
+      res.end('ok');
+    })
+    .catch((err) => {
+      console.error('[WEBHOOK] Error:', err);
       res.status(500).end();
     });
 });
 
-// 启动服务器
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`[SERVER] 运行在端口 ${PORT}`);
-  console.log(`[WEBHOOK] 已就绪: /webhook`);
+// 健康检查端点
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// 调试路由
-app.get('/start', (req, res) => {
+// 所有其他路由重定向到 Telegram
+app.get('*', (req, res) => {
+  console.log(`[ROUTE] Redirecting ${req.url}`);
   res.redirect(process.env.BOT_USERNAME);
 });
 
-app.get('/p', (req, res) => {
-  res.send('使用 /p 命令在 Telegram 中');
+// 启动服务器
+const server = app.listen(PORT, () => {
+  console.log(`[SERVER] ✅ 成功启动于 https://your-project.vercel.app (端口: ${PORT})`);
+  console.log(`[WEBHOOK] 完整路径: https://your-project.vercel.app/webhook`);
+  
+  // 添加健康检查
+  setInterval(() => {
+    console.log('[HEALTH] Server is running');
+  }, 30000);
 });
 
-app.get('/dh', (req, res) => {
-  res.send('使用 /dh 命令在 Telegram 中');
+// 错误处理
+server.on('error', (err) => {
+  console.error('[FATAL] 服务器错误:', err);
+  if (err.code === 'EADDRINUSE') {
+    console.error(`端口 ${PORT} 已被占用`);
+  }
+  process.exit(1);
 });
 
-app.get('/admin', (req, res) => {
-  res.send('使用 /admin 命令在 Telegram 中');
-});
-
-app.get('/c', (req, res) => {
-  res.send('使用 /c 命令在 Telegram 中');
-});
-
-app.get('/cz', (req, res) => {
-  res.send('使用 /cz 命令在 Telegram 中');
-});
+// 确保 BotFather Webhook 正确设置
+if (process.env.NODE_ENV !== 'production') {
+  console.warn('[WARNING] 非生产环境，跳过 BotFather Webhook 设置');
+} else {
+  const { Telegraf } = require('telegraf');
+  const bot = new Telegraf(process.env.BOT_TOKEN);
+  
+  bot.startPolling()
+    .then(() => console.log('[BOT] 长轮询已启动'))
+    .catch(err => console.error('[BOT] 轮询失败:', err));
+}
