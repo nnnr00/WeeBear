@@ -2,10 +2,7 @@
   "name": "telegram-bot",
   "version": "1.0.0",
   "main": "api/webhook.js",
-  "scripts": {
-    "setup": "node scripts/setup-webhook.js"
-  },
   "dependencies": {
-    "pg": "^8.11.3"
+    "@neondatabase/serverless": "^0.9.0"
   }
 }
