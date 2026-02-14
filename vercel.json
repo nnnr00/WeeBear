@@ -1,22 +1,50 @@
 {
   "version": 2,
   "builds": [
-    { "src": "package.json", "use": "@vercel/node" }
+    {
+      "src": "package.json",
+      "use": "@vercel/node"
+    }
   ],
   "routes": [
-    { "src": "/webhook", "dest": "api/commands.js" },
-    { "src": "/start", "dest": "api/commands.js" },
-    { "src": "/p", "dest": "api/commands.js" },
-    { "src": "/dh", "dest": "api/commands.js" },
-    { "src": "/admin", "dest": "api/commands.js" },
-    { "src": "/c", "dest": "api/commands.js" },
-    { "src": "/cz", "dest": "api/commands.js" }
+    {
+      "src": "/webhook",
+      "dest": "index.js",
+      "method": "POST"
+    },
+    {
+      "src": "/start",
+      "dest": "index.js"
+    },
+    {
+      "src": "/p",
+      "dest": "index.js"
+    },
+    {
+      "src": "/dh",
+      "dest": "index.js"
+    },
+    {
+      "src": "/admin",
+      "dest": "index.js"
+    },
+    {
+      "src": "/c",
+      "dest": "index.js"
+    },
+    {
+      "src": "/cz",
+      "dest": "index.js"
+    }
   ],
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "no-store" }
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
       ]
     }
   ]
