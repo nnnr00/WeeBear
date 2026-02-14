@@ -1,13 +1,20 @@
 {
-  "functions": {
-    "api/webhook.js": {
-      "maxDuration": 10
-    }
-  },
-  "rewrites": [
+  "version": 2,
+  "builds": [
     {
-      "source": "/api/webhook",
-      "destination": "/api/webhook"
+      "src": "api/webhook.js",
+      "use": "@vercel/node"
     }
-  ]
+  ],
+  "routes": [
+    {
+      "src": "/api/webhook",
+      "dest": "/api/webhook.js"
+    }
+  ],
+  "env": {
+    "BOT_TOKEN": "@bot_token",
+    "ADMIN_ID": "@admin_id",
+    "WEBHOOK_URL": "@webhook_url"
+  }
 }
