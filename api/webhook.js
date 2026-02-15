@@ -1,17 +1,34 @@
 // api/webhook.js
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║                         🔧 配置区 - 需要修改的内容                              ║
+// ║                         🔧 配置区 - 可以在这里修改                              ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
+// ==================== FILE ID 配置 ====================
+// 使用 /admin 的「获取 File ID」功能获取后填入
 const FILE_IDS = {
-  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJDmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',
-  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKDmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',
-  WELCOME_IMAGE: ''
+  VIP_PROMO: '',           // VIP宣传图
+  PAYMENT_TUTORIAL: '',    // 支付教程图
+  WELCOME_IMAGE: ''        // 欢迎图
 };
 
+// ==================== 链接配置 ====================
 const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
+
+// ==================== 消息过期时间（分钟）====================
 const MESSAGE_EXPIRE_MINUTES = 5;
+
+// ==================== 频率控制配置 ====================
+// 免费次数配置
+const FREE_TIMES_DAY1 = 3;        // 第1天（新用户当天）免费次数
+const FREE_TIMES_DAY2 = 2;        // 第2天免费次数
+const FREE_TIMES_DAY3_PLUS = 1;   // 第3天及以后免费次数
+
+// 每日最大次数
+const MAX_DAILY_TIMES = 6;
+
+// 冷却时间序列（分钟），超过免费次数后按顺序使用
+const COOLDOWN_MINUTES = [5, 15, 30, 50, 60, 60];
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                              以下代码无需修改                                  ║
@@ -33,16 +50,44 @@ function isAdmin(userId) {
   return ADMIN_IDS.includes(parseInt(userId));
 }
 
-function getBeijingDateKey() {
+function getBeijingTime() {
   const now = new Date();
-  const bj = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+
+function getBeijingDateKey() {
+  const bj = getBeijingTime();
   return bj.toISOString().split('T')[0];
 }
 
-function formatBeijingTime(date) {
+function formatBeijingTimeReadable(date) {
   const d = date ? new Date(date) : new Date();
   const bj = new Date(d.getTime() + 8 * 60 * 60 * 1000);
-  return bj.toISOString().replace('T', ' ').substring(0, 19);
+  const year = bj.getUTCFullYear();
+  const month = bj.getUTCMonth() + 1;
+  const day = bj.getUTCDate();
+  const hour = bj.getUTCHours();
+  const minute = bj.getUTCMinutes();
+  return `${year}年${month}月${day}日 ${hour}时${minute}分`;
+}
+
+function calculateDayNumber(firstSeenDate) {
+  const today = getBeijingDateKey();
+  const first = new Date(firstSeenDate);
+  const current = new Date(today);
+  const diffTime = current.getTime() - first.getTime();
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+  return diffDays + 1;
+}
+
+function getFreeTimesForDay(dayNumber) {
+  if (dayNumber === 1) {
+    return FREE_TIMES_DAY1;
+  } else if (dayNumber === 2) {
+    return FREE_TIMES_DAY2;
+  } else {
+    return FREE_TIMES_DAY3_PLUS;
+  }
 }
 
 async function sendTelegram(method, params) {
@@ -147,24 +192,27 @@ async function clearState(userId) {
 
 async function getOrCreateUser(userId, username, firstName) {
   const dateKey = getBeijingDateKey();
+  const nowTimestamp = Date.now();
   try {
     const result = await sql`SELECT * FROM users WHERE user_id = ${userId}`;
     if (!result || result.length === 0) {
       await sql`
-        INSERT INTO users (user_id, username, first_name, first_seen_date, last_seen_date, date_key, daily_count, cooldown_index, last_redeem_time, is_disabled)
-        VALUES (${userId}, ${username || ''}, ${firstName || ''}, ${dateKey}, ${dateKey}, ${dateKey}, 0, 0, 0, false)
+        INSERT INTO users (user_id, username, first_name, first_seen_date, first_seen_timestamp, last_seen_date, last_seen_timestamp, date_key, daily_count, cooldown_index, last_redeem_time, is_disabled)
+        VALUES (${userId}, ${username || ''}, ${firstName || ''}, ${dateKey}, ${nowTimestamp}, ${dateKey}, ${nowTimestamp}, ${dateKey}, 0, 0, 0, false)
       `;
       return {
         userId: userId,
         username: username || '',
         firstName: firstName || '',
         firstSeenDate: dateKey,
+        firstSeenTimestamp: nowTimestamp,
         lastSeenDate: dateKey,
+        lastSeenTimestamp: nowTimestamp,
         dateKey: dateKey,
         dailyCount: 0,
         cooldownIndex: 0,
         lastRedeemTime: 0,
-        isNew: true,
+        isNewUser: true,
         isDisabled: false
       };
     }
@@ -179,13 +227,15 @@ async function getOrCreateUser(userId, username, firstName) {
       await sql`
         UPDATE users 
         SET date_key = ${dateKey}, daily_count = 0, cooldown_index = 0, last_redeem_time = 0, 
-            last_seen_date = ${dateKey}, username = ${username || user.username || ''}, first_name = ${firstName || user.first_name || ''}
+            last_seen_date = ${dateKey}, last_seen_timestamp = ${nowTimestamp},
+            username = ${username || user.username || ''}, first_name = ${firstName || user.first_name || ''}
         WHERE user_id = ${userId}
       `;
     } else {
       await sql`
         UPDATE users 
-        SET last_seen_date = ${dateKey}, username = ${username || user.username || ''}, first_name = ${firstName || user.first_name || ''}
+        SET last_seen_date = ${dateKey}, last_seen_timestamp = ${nowTimestamp},
+            username = ${username || user.username || ''}, first_name = ${firstName || user.first_name || ''}
         WHERE user_id = ${userId}
       `;
     }
@@ -194,12 +244,14 @@ async function getOrCreateUser(userId, username, firstName) {
       username: user.username || '',
       firstName: user.first_name || '',
       firstSeenDate: user.first_seen_date,
+      firstSeenTimestamp: parseInt(user.first_seen_timestamp) || nowTimestamp,
       lastSeenDate: user.last_seen_date,
+      lastSeenTimestamp: parseInt(user.last_seen_timestamp) || nowTimestamp,
       dateKey: dateKey,
       dailyCount: dailyCount,
       cooldownIndex: cooldownIndex,
       lastRedeemTime: lastRedeemTime,
-      isNew: user.first_seen_date === dateKey,
+      isNewUser: false,
       isDisabled: user.is_disabled || false
     };
   } catch (e) {
@@ -208,13 +260,30 @@ async function getOrCreateUser(userId, username, firstName) {
       userId: userId,
       username: username || '',
       firstName: firstName || '',
+      firstSeenDate: dateKey,
+      firstSeenTimestamp: nowTimestamp,
       dateKey: dateKey,
       dailyCount: 0,
       cooldownIndex: 0,
       lastRedeemTime: 0,
-      isNew: true,
+      isNewUser: true,
       isDisabled: false
     };
+  }
+}
+
+async function notifyAdminsNewUser(userId, username, firstName) {
+  const timeStr = formatBeijingTimeReadable(new Date());
+  for (const adminId of ADMIN_IDS) {
+    try {
+      await sendTelegram('sendMessage', {
+        chat_id: adminId,
+        text: `🆕 <b>新用户登录</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${firstName || '未知'}\n👤 <b>用户名</b>：@${username || '无'}\n🆔 <b>ID</b>：<code>${userId}</code>\n⏰ <b>时间</b>：${timeStr}\n━━━━━━━━━━━━━━`,
+        parse_mode: 'HTML'
+      });
+    } catch (e) {
+      console.error('Notify admin new user error:', e.message);
+    }
   }
 }
 
@@ -237,7 +306,15 @@ module.exports = async (req, res) => {
       status: 'Bot is running',
       token: BOT_TOKEN ? 'OK' : 'Missing',
       database: DATABASE_URL ? 'OK' : 'Missing',
-      admins: ADMIN_IDS
+      admins: ADMIN_IDS,
+      config: {
+        FREE_TIMES_DAY1,
+        FREE_TIMES_DAY2,
+        FREE_TIMES_DAY3_PLUS,
+        MAX_DAILY_TIMES,
+        COOLDOWN_MINUTES,
+        MESSAGE_EXPIRE_MINUTES
+      }
     });
   }
   if (req.method !== 'POST') {
@@ -283,13 +360,14 @@ async function handleMessage(msg) {
 
   if (text === '/cz' && isAdmin(userId)) {
     const dateKey = getBeijingDateKey();
+    const nowTimestamp = Date.now();
     try {
-      await sql`UPDATE users SET daily_count = 0, cooldown_index = 0, last_redeem_time = 0, first_seen_date = ${dateKey}, date_key = ${dateKey} WHERE user_id = ${userId}`;
+      await sql`UPDATE users SET daily_count = 0, cooldown_index = 0, last_redeem_time = 0, first_seen_date = ${dateKey}, first_seen_timestamp = ${nowTimestamp}, date_key = ${dateKey} WHERE user_id = ${userId}`;
     } catch (e) {
       console.error('Reset Error:', e.message);
     }
     await clearState(userId);
-    return await sendTelegram('sendMessage', { chat_id: chatId, text: '✅ 已重置为新用户状态' });
+    return await sendTelegram('sendMessage', { chat_id: chatId, text: '✅ 已重置为新用户状态（第1天）' });
   }
 
   if (text === '/p' && isAdmin(userId)) {
@@ -299,7 +377,10 @@ async function handleMessage(msg) {
 
   if (text === '/start' || text === '/start ') {
     await clearState(userId);
-    await getOrCreateUser(userId, username, firstName);
+    const user = await getOrCreateUser(userId, username, firstName);
+    if (user.isNewUser) {
+      await notifyAdminsNewUser(userId, username, firstName);
+    }
     return await showWelcome(chatId, null);
   }
 
@@ -502,16 +583,17 @@ async function handleStateInput(chatId, userId, username, firstName, msg, userSt
       });
     }
     if (orderNumber.startsWith('20260')) {
+      const timeStr = formatBeijingTimeReadable(new Date());
       try {
         await sql`
-          INSERT INTO tickets (user_id, username, first_name, order_number)
-          VALUES (${userId}, ${username}, ${firstName}, ${orderNumber})
+          INSERT INTO tickets (user_id, username, first_name, order_number, created_timestamp)
+          VALUES (${userId}, ${username}, ${firstName}, ${orderNumber}, ${Date.now()})
         `;
         for (const adminId of ADMIN_IDS) {
           try {
             await sendTelegram('sendMessage', {
               chat_id: adminId,
-              text: `🎫 <b>新工单</b>\n\n👤 ${firstName || '未知'}\n👤 @${username || '无'}\n🆔 <code>${userId}</code>\n📝 <code>${orderNumber}</code>\n⏰ ${formatBeijingTime(new Date())}`,
+              text: `🎫 <b>新工单</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${firstName || '未知'}\n👤 <b>用户名</b>：@${username || '无'}\n🆔 <b>ID</b>：<code>${userId}</code>\n📝 <b>订单号</b>：<code>${orderNumber}</code>\n⏰ <b>时间</b>：${timeStr}\n━━━━━━━━━━━━━━`,
               parse_mode: 'HTML'
             });
           } catch (e) {
@@ -879,12 +961,10 @@ async function showRedeem(chatId, userId, username, firstName, messageId) {
   const dailyCount = user.dailyCount || 0;
   const cooldownIndex = user.cooldownIndex || 0;
   const lastRedeemTime = user.lastRedeemTime || 0;
-  const isNewUser = user.isNew;
-  const freeLimit = isNewUser ? 3 : 2;
-  const cooldowns = [5, 15, 30, 50, 60, 60];
-  const maxDaily = 6;
+  const dayNumber = calculateDayNumber(user.firstSeenDate);
+  const freeLimit = getFreeTimesForDay(dayNumber);
 
-  if (dailyCount >= maxDaily) {
+  if (dailyCount >= MAX_DAILY_TIMES) {
     const text = '⏰ <b>今日次数已用完</b>\n\n🌙 明天再来～\n\n💡 VIP会员无限制';
     const keyboard = {
       inline_keyboard: [
@@ -914,8 +994,8 @@ async function showRedeem(chatId, userId, username, firstName, messageId) {
   }
 
   const now = Date.now();
-  const cdIndex = Math.min(cooldownIndex, cooldowns.length - 1);
-  const cdTime = cooldowns[cdIndex] * 60 * 1000;
+  const cdIndex = Math.min(cooldownIndex, COOLDOWN_MINUTES.length - 1);
+  const cdTime = COOLDOWN_MINUTES[cdIndex] * 60 * 1000;
   const elapsed = now - lastRedeemTime;
 
   if (elapsed < cdTime) {
@@ -1029,13 +1109,14 @@ async function showRedeemPage(chatId, messageId, page) {
 
 async function handleRedeemProduct(chatId, userId, username, firstName, keyword, messageId) {
   const user = await getOrCreateUser(userId, username, firstName);
-  const freeLimit = user.isNew ? 3 : 2;
+  const dayNumber = calculateDayNumber(user.firstSeenDate);
+  const freeLimit = getFreeTimesForDay(dayNumber);
   const dailyCount = user.dailyCount || 0;
 
   try {
     let newCooldownIndex = user.cooldownIndex || 0;
     if (dailyCount >= freeLimit) {
-      newCooldownIndex = Math.min(newCooldownIndex + 1, 5);
+      newCooldownIndex = Math.min(newCooldownIndex + 1, COOLDOWN_MINUTES.length - 1);
     }
     await sql`
       UPDATE users 
@@ -1326,7 +1407,11 @@ async function showTicketDetail(chatId, messageId, ticketId) {
     });
   }
 
-  const text = `🎫 <b>工单详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${ticket.first_name || '未知'}\n👤 <b>用户名</b>：@${ticket.username || '无'}\n🆔 <b>用户ID</b>：<code>${ticket.user_id}</code>\n📝 <b>订单号</b>：<code>${ticket.order_number}</code>\n⏰ <b>时间</b>：${formatBeijingTime(ticket.created_at)}\n━━━━━━━━━━━━━━`;
+  const timeStr = ticket.created_timestamp
+    ? formatBeijingTimeReadable(new Date(parseInt(ticket.created_timestamp)))
+    : formatBeijingTimeReadable(ticket.created_at);
+
+  const text = `🎫 <b>工单详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${ticket.first_name || '未知'}\n👤 <b>用户名</b>：@${ticket.username || '无'}\n🆔 <b>用户ID</b>：<code>${ticket.user_id}</code>\n📝 <b>订单号</b>：<code>${ticket.order_number}</code>\n⏰ <b>提交时间</b>：${timeStr}\n━━━━━━━━━━━━━━`;
 
   const keyboard = {
     inline_keyboard: [
@@ -1417,10 +1502,18 @@ async function showUserDetail(chatId, messageId, targetUserId) {
   }
 
   const status = user.is_disabled ? '🔴 已停用' : '🟢 正常';
-  const dateKey = getBeijingDateKey();
-  const isNewUser = user.first_seen_date === dateKey;
+  const dayNumber = calculateDayNumber(user.first_seen_date);
+  const freeLimit = getFreeTimesForDay(dayNumber);
 
-  const text = `👤 <b>用户详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${user.first_name || '未知'}\n👤 <b>用户名</b>：@${user.username || '无'}\n🆔 <b>ID</b>：<code>${user.user_id}</code>\n📅 <b>首次</b>：${user.first_seen_date || '未知'}\n📅 <b>最近</b>：${user.last_seen_date || '未知'}\n📊 <b>今日兑换</b>：${user.daily_count || 0} 次\n⏱️ <b>冷却等级</b>：${user.cooldown_index || 0}\n🆕 <b>新用户</b>：${isNewUser ? '是' : '否'}\n⚡ <b>状态</b>：${status}\n━━━━━━━━━━━━━━`;
+  const firstSeenTimeStr = user.first_seen_timestamp
+    ? formatBeijingTimeReadable(new Date(parseInt(user.first_seen_timestamp)))
+    : user.first_seen_date;
+
+  const lastSeenTimeStr = user.last_seen_timestamp
+    ? formatBeijingTimeReadable(new Date(parseInt(user.last_seen_timestamp)))
+    : user.last_seen_date;
+
+  const text = `👤 <b>用户详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${user.first_name || '未知'}\n👤 <b>用户名</b>：@${user.username || '无'}\n🆔 <b>ID</b>：<code>${user.user_id}</code>\n📅 <b>首次登录</b>：${firstSeenTimeStr}\n📅 <b>最近访问</b>：${lastSeenTimeStr}\n📊 <b>今日兑换</b>：${user.daily_count || 0}/${MAX_DAILY_TIMES} 次\n🆓 <b>免费次数</b>：${freeLimit} 次/天\n⏱️ <b>冷却等级</b>：${user.cooldown_index || 0}\n📆 <b>用户天数</b>：第 ${dayNumber} 天\n⚡ <b>状态</b>：${status}\n━━━━━━━━━━━━━━`;
 
   const toggleText = user.is_disabled ? '✅ 启用用户' : '🔴 停用用户';
 
