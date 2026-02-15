@@ -15,7 +15,7 @@ const FILE_IDS = {
 const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
 
 // ==================== 消息过期时间（分钟）====================
-const MESSAGE_EXPIRE_MINUTES = 0.1;
+const MESSAGE_EXPIRE_MINUTES = 2;
 
 // ==================== 频率控制配置 ====================
 const FREE_TIMES_DAY1 = 3;
