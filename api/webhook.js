@@ -7,8 +7,8 @@
 // ==================== FILE ID 配置 ====================
 // 使用 /admin 的「获取 File ID」功能获取后填入
 const FILE_IDS = {
-  VIP_PROMO: '',           // VIP宣传图
-  PAYMENT_TUTORIAL: '',    // 支付教程图
+  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJDmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',           // VIP宣传图
+  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKDmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',    // 支付教程图
   WELCOME_IMAGE: ''        // 欢迎图
 };
 
