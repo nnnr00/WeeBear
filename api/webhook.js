@@ -6,8 +6,8 @@
 
 // ==================== FILE ID 配置 ====================
 const FILE_IDS = {
-  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJxmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',
-  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKxmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',
+  VIP_PROMO: '',
+  PAYMENT_TUTORIAL: 'Q',
   WELCOME_IMAGE: ''
 };
 
