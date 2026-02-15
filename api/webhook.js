@@ -5,11 +5,10 @@
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 // ==================== FILE ID 配置 ====================
-// 使用 /admin 的「获取 File ID」功能获取后填入
 const FILE_IDS = {
-  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJDmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',           // VIP宣传图
-  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKDmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',    // 支付教程图
-  WELCOME_IMAGE: ''        // 欢迎图
+  VIP_PROMO: 'AgACAgUAAxkBAAInTWmQUBFxbPNxw_V1cX9EcitkgzESAAJJxmsbHfaBVFcwjzXezuCAAQADAgADeQADOgQ',
+  PAYMENT_TUTORIAL: 'AgACAgUAAxkBAAInT2mQUBrqxqbLz7MG8QL14mGg6DIVAAJKxmsbHfaBVDUjLYHjFzEgAQADAgADeQADOgQ',
+  WELCOME_IMAGE: ''
 };
 
 // ==================== 链接配置 ====================
@@ -19,15 +18,10 @@ const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
 const MESSAGE_EXPIRE_MINUTES = 5;
 
 // ==================== 频率控制配置 ====================
-// 免费次数配置
-const FREE_TIMES_DAY1 = 3;        // 第1天（新用户当天）免费次数
-const FREE_TIMES_DAY2 = 2;        // 第2天免费次数
-const FREE_TIMES_DAY3_PLUS = 1;   // 第3天及以后免费次数
-
-// 每日最大次数
+const FREE_TIMES_DAY1 = 3;
+const FREE_TIMES_DAY2 = 2;
+const FREE_TIMES_DAY3_PLUS = 1;
 const MAX_DAILY_TIMES = 6;
-
-// 冷却时间序列（分钟），超过免费次数后按顺序使用
 const COOLDOWN_MINUTES = [5, 15, 30, 50, 60, 60];
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -60,8 +54,9 @@ function getBeijingDateKey() {
   return bj.toISOString().split('T')[0];
 }
 
-function formatBeijingTimeReadable(date) {
-  const d = date ? new Date(date) : new Date();
+function formatBeijingTimeReadable(timestamp) {
+  if (!timestamp) return '未知';
+  const d = new Date(parseInt(timestamp));
   const bj = new Date(d.getTime() + 8 * 60 * 60 * 1000);
   const year = bj.getUTCFullYear();
   const month = bj.getUTCMonth() + 1;
@@ -72,22 +67,19 @@ function formatBeijingTimeReadable(date) {
 }
 
 function calculateDayNumber(firstSeenDate) {
+  if (!firstSeenDate) return 1;
   const today = getBeijingDateKey();
-  const first = new Date(firstSeenDate);
-  const current = new Date(today);
+  const first = new Date(firstSeenDate + 'T00:00:00Z');
+  const current = new Date(today + 'T00:00:00Z');
   const diffTime = current.getTime() - first.getTime();
   const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-  return diffDays + 1;
+  return Math.max(1, diffDays + 1);
 }
 
 function getFreeTimesForDay(dayNumber) {
-  if (dayNumber === 1) {
-    return FREE_TIMES_DAY1;
-  } else if (dayNumber === 2) {
-    return FREE_TIMES_DAY2;
-  } else {
-    return FREE_TIMES_DAY3_PLUS;
-  }
+  if (dayNumber === 1) return FREE_TIMES_DAY1;
+  if (dayNumber === 2) return FREE_TIMES_DAY2;
+  return FREE_TIMES_DAY3_PLUS;
 }
 
 async function sendTelegram(method, params) {
@@ -135,10 +127,10 @@ async function deleteExpiredMessages(userId, chatId) {
       for (const msg of messages) {
         try {
           await sendTelegram('deleteMessage', { chat_id: chatId, message_id: msg.message_id });
-        } catch (e) {
-          console.error('Delete message error:', e.message);
-        }
-        await sql`DELETE FROM sent_messages WHERE id = ${msg.id}`;
+        } catch (e) {}
+        try {
+          await sql`DELETE FROM sent_messages WHERE id = ${msg.id}`;
+        } catch (e) {}
       }
     }
   } catch (e) {
@@ -197,8 +189,8 @@ async function getOrCreateUser(userId, username, firstName) {
     const result = await sql`SELECT * FROM users WHERE user_id = ${userId}`;
     if (!result || result.length === 0) {
       await sql`
-        INSERT INTO users (user_id, username, first_name, first_seen_date, first_seen_timestamp, last_seen_date, last_seen_timestamp, date_key, daily_count, cooldown_index, last_redeem_time, is_disabled)
-        VALUES (${userId}, ${username || ''}, ${firstName || ''}, ${dateKey}, ${nowTimestamp}, ${dateKey}, ${nowTimestamp}, ${dateKey}, 0, 0, 0, false)
+        INSERT INTO users (user_id, username, first_name, first_seen_date, first_seen_timestamp, last_seen_date, last_seen_timestamp, date_key, daily_count, cooldown_index, last_redeem_time, total_redeem_count, total_cooldown_count, is_disabled)
+        VALUES (${userId}, ${username || ''}, ${firstName || ''}, ${dateKey}, ${nowTimestamp}, ${dateKey}, ${nowTimestamp}, ${dateKey}, 0, 0, 0, 0, 0, false)
       `;
       return {
         userId: userId,
@@ -212,6 +204,8 @@ async function getOrCreateUser(userId, username, firstName) {
         dailyCount: 0,
         cooldownIndex: 0,
         lastRedeemTime: 0,
+        totalRedeemCount: 0,
+        totalCooldownCount: 0,
         isNewUser: true,
         isDisabled: false
       };
@@ -251,6 +245,8 @@ async function getOrCreateUser(userId, username, firstName) {
       dailyCount: dailyCount,
       cooldownIndex: cooldownIndex,
       lastRedeemTime: lastRedeemTime,
+      totalRedeemCount: user.total_redeem_count || 0,
+      totalCooldownCount: user.total_cooldown_count || 0,
       isNewUser: false,
       isDisabled: user.is_disabled || false
     };
@@ -266,6 +262,8 @@ async function getOrCreateUser(userId, username, firstName) {
       dailyCount: 0,
       cooldownIndex: 0,
       lastRedeemTime: 0,
+      totalRedeemCount: 0,
+      totalCooldownCount: 0,
       isNewUser: true,
       isDisabled: false
     };
@@ -273,7 +271,7 @@ async function getOrCreateUser(userId, username, firstName) {
 }
 
 async function notifyAdminsNewUser(userId, username, firstName) {
-  const timeStr = formatBeijingTimeReadable(new Date());
+  const timeStr = formatBeijingTimeReadable(Date.now());
   for (const adminId of ADMIN_IDS) {
     try {
       await sendTelegram('sendMessage', {
@@ -583,25 +581,27 @@ async function handleStateInput(chatId, userId, username, firstName, msg, userSt
       });
     }
     if (orderNumber.startsWith('20260')) {
-      const timeStr = formatBeijingTimeReadable(new Date());
+      const nowTimestamp = Date.now();
+      const timeStr = formatBeijingTimeReadable(nowTimestamp);
       try {
         await sql`
           INSERT INTO tickets (user_id, username, first_name, order_number, created_timestamp)
-          VALUES (${userId}, ${username}, ${firstName}, ${orderNumber}, ${Date.now()})
+          VALUES (${userId}, ${username}, ${firstName}, ${orderNumber}, ${nowTimestamp})
         `;
-        for (const adminId of ADMIN_IDS) {
-          try {
-            await sendTelegram('sendMessage', {
-              chat_id: adminId,
-              text: `🎫 <b>新工单</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${firstName || '未知'}\n👤 <b>用户名</b>：@${username || '无'}\n🆔 <b>ID</b>：<code>${userId}</code>\n📝 <b>订单号</b>：<code>${orderNumber}</code>\n⏰ <b>时间</b>：${timeStr}\n━━━━━━━━━━━━━━`,
-              parse_mode: 'HTML'
-            });
-          } catch (e) {
-            console.error('Notify admin error:', e.message);
-          }
-        }
+        console.log(`Ticket created for user ${userId}, order ${orderNumber}`);
       } catch (e) {
         console.error('Create ticket error:', e.message);
+      }
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await sendTelegram('sendMessage', {
+            chat_id: adminId,
+            text: `🎫 <b>新工单</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${firstName || '未知'}\n👤 <b>用户名</b>：@${username || '无'}\n🆔 <b>ID</b>：<code>${userId}</code>\n📝 <b>订单号</b>：<code>${orderNumber}</code>\n⏰ <b>时间</b>：${timeStr}\n━━━━━━━━━━━━━━`,
+            parse_mode: 'HTML'
+          });
+        } catch (e) {
+          console.error('Notify admin error:', e.message);
+        }
       }
       await clearState(userId);
       return await sendTelegram('sendMessage', {
@@ -964,6 +964,8 @@ async function showRedeem(chatId, userId, username, firstName, messageId) {
   const dayNumber = calculateDayNumber(user.firstSeenDate);
   const freeLimit = getFreeTimesForDay(dayNumber);
 
+  console.log(`showRedeem: userId=${userId}, dayNumber=${dayNumber}, freeLimit=${freeLimit}, dailyCount=${dailyCount}, cooldownIndex=${cooldownIndex}, lastRedeemTime=${lastRedeemTime}`);
+
   if (dailyCount >= MAX_DAILY_TIMES) {
     const text = '⏰ <b>今日次数已用完</b>\n\n🌙 明天再来～\n\n💡 VIP会员无限制';
     const keyboard = {
@@ -995,14 +997,16 @@ async function showRedeem(chatId, userId, username, firstName, messageId) {
 
   const now = Date.now();
   const cdIndex = Math.min(cooldownIndex, COOLDOWN_MINUTES.length - 1);
-  const cdTime = COOLDOWN_MINUTES[cdIndex] * 60 * 1000;
+  const cdTimeMs = COOLDOWN_MINUTES[cdIndex] * 60 * 1000;
   const elapsed = now - lastRedeemTime;
 
-  if (elapsed < cdTime) {
-    const remaining = Math.ceil((cdTime - elapsed) / 1000);
+  console.log(`Cooldown check: cdIndex=${cdIndex}, cdTimeMs=${cdTimeMs}, elapsed=${elapsed}, needWait=${elapsed < cdTimeMs}`);
+
+  if (lastRedeemTime > 0 && elapsed < cdTimeMs) {
+    const remaining = Math.ceil((cdTimeMs - elapsed) / 1000);
     const mins = Math.floor(remaining / 60);
     const secs = remaining % 60;
-    const text = `⏰ <b>冷却中...</b>\n\n⏳ 剩余：${mins}分${secs}秒\n\n💡 VIP会员无等待`;
+    const text = `⏰ <b>冷却中...</b>\n\n⏳ 剩余时间：${mins}分${secs}秒\n\n💡 VIP会员无需等待`;
     const keyboard = {
       inline_keyboard: [
         [{ text: '💎 加入会员（新春特价）', callback_data: 'join_vip' }],
@@ -1112,17 +1116,30 @@ async function handleRedeemProduct(chatId, userId, username, firstName, keyword,
   const dayNumber = calculateDayNumber(user.firstSeenDate);
   const freeLimit = getFreeTimesForDay(dayNumber);
   const dailyCount = user.dailyCount || 0;
+  const cooldownIndex = user.cooldownIndex || 0;
+  const totalRedeemCount = user.totalRedeemCount || 0;
+  const totalCooldownCount = user.totalCooldownCount || 0;
+
+  const nowTimestamp = Date.now();
+  let newCooldownIndex = cooldownIndex;
+  let newTotalCooldownCount = totalCooldownCount;
+
+  if (dailyCount >= freeLimit) {
+    newCooldownIndex = Math.min(cooldownIndex + 1, COOLDOWN_MINUTES.length - 1);
+    newTotalCooldownCount = totalCooldownCount + 1;
+  }
 
   try {
-    let newCooldownIndex = user.cooldownIndex || 0;
-    if (dailyCount >= freeLimit) {
-      newCooldownIndex = Math.min(newCooldownIndex + 1, COOLDOWN_MINUTES.length - 1);
-    }
     await sql`
       UPDATE users 
-      SET daily_count = ${dailyCount + 1}, cooldown_index = ${newCooldownIndex}, last_redeem_time = ${Date.now()}
+      SET daily_count = ${dailyCount + 1}, 
+          cooldown_index = ${newCooldownIndex}, 
+          last_redeem_time = ${nowTimestamp},
+          total_redeem_count = ${totalRedeemCount + 1},
+          total_cooldown_count = ${newTotalCooldownCount}
       WHERE user_id = ${userId}
     `;
+    console.log(`Updated user ${userId}: dailyCount=${dailyCount + 1}, cooldownIndex=${newCooldownIndex}, lastRedeemTime=${nowTimestamp}`);
   } catch (e) {
     console.error('Update redeem error:', e.message);
   }
@@ -1339,7 +1356,7 @@ async function showProductManagement(chatId, messageId, page) {
 async function showTickets(chatId, messageId, page) {
   let tickets = [];
   try {
-    tickets = await sql`SELECT * FROM tickets ORDER BY created_at ASC`;
+    tickets = await sql`SELECT * FROM tickets ORDER BY created_at DESC`;
   } catch (e) {}
 
   const pageSize = 10;
@@ -1350,7 +1367,8 @@ async function showTickets(chatId, messageId, page) {
 
   const buttons = [];
   for (const t of pageTickets) {
-    buttons.push([{ text: `👤 ${t.first_name || '未知'} (${t.user_id})`, callback_data: 'ticket_detail_' + t.id }]);
+    const timeStr = t.created_timestamp ? formatBeijingTimeReadable(t.created_timestamp) : '未知';
+    buttons.push([{ text: `👤 ${t.first_name || '未知'} - ${timeStr}`, callback_data: 'ticket_detail_' + t.id }]);
   }
 
   const navButtons = [];
@@ -1408,8 +1426,8 @@ async function showTicketDetail(chatId, messageId, ticketId) {
   }
 
   const timeStr = ticket.created_timestamp
-    ? formatBeijingTimeReadable(new Date(parseInt(ticket.created_timestamp)))
-    : formatBeijingTimeReadable(ticket.created_at);
+    ? formatBeijingTimeReadable(parseInt(ticket.created_timestamp))
+    : '未知';
 
   const text = `🎫 <b>工单详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${ticket.first_name || '未知'}\n👤 <b>用户名</b>：@${ticket.username || '无'}\n🆔 <b>用户ID</b>：<code>${ticket.user_id}</code>\n📝 <b>订单号</b>：<code>${ticket.order_number}</code>\n⏰ <b>提交时间</b>：${timeStr}\n━━━━━━━━━━━━━━`;
 
@@ -1432,7 +1450,7 @@ async function showTicketDetail(chatId, messageId, ticketId) {
 async function showUsers(chatId, messageId, page) {
   let users = [];
   try {
-    users = await sql`SELECT * FROM users ORDER BY first_seen_date ASC`;
+    users = await sql`SELECT * FROM users ORDER BY first_seen_timestamp DESC`;
   } catch (e) {}
 
   const pageSize = 10;
@@ -1444,7 +1462,8 @@ async function showUsers(chatId, messageId, page) {
   const buttons = [];
   for (const u of pageUsers) {
     const status = u.is_disabled ? '🔴' : '🟢';
-    buttons.push([{ text: `${status} ${u.first_name || '未知'} (${u.user_id})`, callback_data: 'user_detail_' + u.user_id }]);
+    const dayNumber = calculateDayNumber(u.first_seen_date);
+    buttons.push([{ text: `${status} ${u.first_name || '未知'} (第${dayNumber}天)`, callback_data: 'user_detail_' + u.user_id }]);
   }
 
   const navButtons = [];
@@ -1488,7 +1507,9 @@ async function showUserDetail(chatId, messageId, targetUserId) {
     if (r && r.length > 0) {
       user = r[0];
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error('Get user error:', e.message);
+  }
 
   if (!user) {
     return await sendTelegram('editMessageText', {
@@ -1506,14 +1527,32 @@ async function showUserDetail(chatId, messageId, targetUserId) {
   const freeLimit = getFreeTimesForDay(dayNumber);
 
   const firstSeenTimeStr = user.first_seen_timestamp
-    ? formatBeijingTimeReadable(new Date(parseInt(user.first_seen_timestamp)))
-    : user.first_seen_date;
+    ? formatBeijingTimeReadable(parseInt(user.first_seen_timestamp))
+    : (user.first_seen_date || '未知');
 
   const lastSeenTimeStr = user.last_seen_timestamp
-    ? formatBeijingTimeReadable(new Date(parseInt(user.last_seen_timestamp)))
-    : user.last_seen_date;
+    ? formatBeijingTimeReadable(parseInt(user.last_seen_timestamp))
+    : (user.last_seen_date || '未知');
 
-  const text = `👤 <b>用户详情</b>\n\n━━━━━━━━━━━━━━\n👤 <b>姓名</b>：${user.first_name || '未知'}\n👤 <b>用户名</b>：@${user.username || '无'}\n🆔 <b>ID</b>：<code>${user.user_id}</code>\n📅 <b>首次登录</b>：${firstSeenTimeStr}\n📅 <b>最近访问</b>：${lastSeenTimeStr}\n📊 <b>今日兑换</b>：${user.daily_count || 0}/${MAX_DAILY_TIMES} 次\n🆓 <b>免费次数</b>：${freeLimit} 次/天\n⏱️ <b>冷却等级</b>：${user.cooldown_index || 0}\n📆 <b>用户天数</b>：第 ${dayNumber} 天\n⚡ <b>状态</b>：${status}\n━━━━━━━━━━━━━━`;
+  const totalRedeemCount = user.total_redeem_count || 0;
+  const dailyCount = user.daily_count || 0;
+  const cooldownIndex = user.cooldown_index || 0;
+  const totalCooldownCount = user.total_cooldown_count || 0;
+
+  const text = `👤 <b>用户详情</b>\n\n` +
+    `━━━━━━━━━━━━━━\n` +
+    `👤 <b>姓名</b>：${user.first_name || '未知'}\n` +
+    `👤 <b>用户名</b>：@${user.username || '无'}\n` +
+    `🆔 <b>ID</b>：<code>${user.user_id}</code>\n` +
+    `📅 <b>首次登录</b>：${firstSeenTimeStr}\n` +
+    `📅 <b>最近访问</b>：${lastSeenTimeStr}\n` +
+    `📊 <b>总兑换</b>：${totalRedeemCount} 次\n` +
+    `🆓 <b>今日兑换</b>：${dailyCount}/${MAX_DAILY_TIMES} 次（免费${freeLimit}次）\n` +
+    `⏱️ <b>今日冷却</b>：${cooldownIndex} 次\n` +
+    `⏱️ <b>总冷却</b>：${totalCooldownCount} 次\n` +
+    `📆 <b>用户天数</b>：第 ${dayNumber} 天\n` +
+    `⚡ <b>状态</b>：${status}\n` +
+    `━━━━━━━━━━━━━━`;
 
   const toggleText = user.is_disabled ? '✅ 启用用户' : '🔴 停用用户';
 
