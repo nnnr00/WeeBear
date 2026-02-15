@@ -7,7 +7,7 @@
 // ==================== FILE ID 配置 ====================
 const FILE_IDS = {
   VIP_PROMO: '',
-  PAYMENT_TUTORIAL: 'Q',
+  PAYMENT_TUTORIAL: '',
   WELCOME_IMAGE: ''
 };
 
