@@ -21,7 +21,7 @@ const MESSAGE_EXPIRE_MINUTES = 2;
 const FREE_TIMES_DAY1 = 3;
 const FREE_TIMES_DAY2 = 2;
 const FREE_TIMES_DAY3_PLUS = 1;
-const MAX_DAILY_TIMES = 3;
+const MAX_DAILY_TIMES = 6;
 const COOLDOWN_MINUTES = [10, 50, 60];
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
