@@ -22,7 +22,7 @@ const FREE_TIMES_DAY1 = 3;
 const FREE_TIMES_DAY2 = 2;
 const FREE_TIMES_DAY3_PLUS = 1;
 const MAX_DAILY_TIMES = 6;
-const COOLDOWN_MINUTES = [10, 50, 60];
+const COOLDOWN_MINUTES = [0.05, 0.05, 0.1, 0.1, 1];
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                              以下代码无需修改                                  ║
