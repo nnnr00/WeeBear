@@ -387,11 +387,14 @@ async function handleMessage(msg) {
     return await showRedeem(chatId, userId, username, firstName, null);
   }
 
-  if (text === '/v') {
+    if (text === '/start v' || text === '/v') {
     await clearState(userId);
+    const user = await getOrCreateUser(userId, username, firstName);
+    if (user.isNewUser) {
+      await notifyAdminsNewUser(userId, username, firstName);
+    }
     return await showVIP(chatId, null);
   }
-}
 
 async function handleStateInput(chatId, userId, username, firstName, msg, userState) {
   const text = msg.text || '';
