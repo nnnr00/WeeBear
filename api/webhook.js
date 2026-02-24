@@ -373,6 +373,26 @@ async function handleMessage(msg) {
     return await showProductManagement(chatId, null, 1);
   }
 
+  // ⚠️ 深层链接必须放在 /start 前面
+  if (text === '/start dh' || text === '/dh') {
+    await clearState(userId);
+    const user = await getOrCreateUser(userId, username, firstName);
+    if (user.isNewUser) {
+      await notifyAdminsNewUser(userId, username, firstName);
+    }
+    return await showRedeem(chatId, userId, username, firstName, null);
+  }
+
+  if (text === '/start v' || text === '/v') {
+    await clearState(userId);
+    const user = await getOrCreateUser(userId, username, firstName);
+    if (user.isNewUser) {
+      await notifyAdminsNewUser(userId, username, firstName);
+    }
+    return await showVIP(chatId, null);
+  }
+
+  // 普通 /start 放最后
   if (text === '/start' || text === '/start ') {
     await clearState(userId);
     const user = await getOrCreateUser(userId, username, firstName);
@@ -381,20 +401,7 @@ async function handleMessage(msg) {
     }
     return await showWelcome(chatId, null);
   }
-
-  if (text === '/start dh' || text === '/dh') {
-    await clearState(userId);
-    return await showRedeem(chatId, userId, username, firstName, null);
-  }
-
-    if (text === '/start v' || text === '/v') {
-    await clearState(userId);
-    const user = await getOrCreateUser(userId, username, firstName);
-    if (user.isNewUser) {
-      await notifyAdminsNewUser(userId, username, firstName);
-    }
-    return await showVIP(chatId, null);
-  }
+}
 
 async function handleStateInput(chatId, userId, username, firstName, msg, userState) {
   const text = msg.text || '';
