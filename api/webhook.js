@@ -18,11 +18,11 @@ const VIP_GROUP_LINK = 'https://t.me/+495j5rWmApsxYzg9';
 const MESSAGE_EXPIRE_MINUTES = 2;
 
 // ==================== 频率控制配置 ====================
-const FREE_TIMES_DAY1 = 3;
+const FREE_TIMES_DAY1 = 2;
 const FREE_TIMES_DAY2 = 2;
 const FREE_TIMES_DAY3_PLUS = 1;
-const MAX_DAILY_TIMES = 6;
-const COOLDOWN_MINUTES = [8, 30, 40, 50, 60];
+const MAX_DAILY_TIMES = 5;
+const COOLDOWN_MINUTES = [8, 45, 50, 60, 60];
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                              以下代码无需修改                                  ║
